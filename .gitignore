@@ -1,0 +1,25 @@
+# ================= Python =================
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# ================= 打包产物 =================
+build/
+dist/
+
+# ================= 敏感文件（务必不要提交）=================
+# config.json   里面是账号密码（base64，可还原）
+# login.json    登录状态 cookie，泄露等于别人可以用你的账号
+# login_account.txt 记录当前 cookie 属于哪个账号
+config.json
+login.json
+login_account.txt
+
+# ================= 运行/调试产生的内容 =================
+log.log
+# 签到结果截图（只忽略根目录下的 png）
+/*.png
+# 验证码调试素材（截图、DOM 抓包、分析图）
+captcha_debug/

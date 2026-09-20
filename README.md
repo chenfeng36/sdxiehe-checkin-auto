@@ -49,7 +49,10 @@ python -m venv .venv
    .venv\Scripts\python autoCheckIn.py
    ```
 
-   或者在 Releases 里下载打包好的 `自动签到.exe` 双击运行。
+   或者在 [Releases](https://github.com/chenfeng36/sdxiehe-checkin-auto/releases) 里下载打包好的
+   `autoCheckIn.exe`（说明文档为 `instructions.txt`）双击运行；下载后可自行重命名为「自动签到.exe」。
+
+   > GitHub 不支持中文附件名（会被自动替换成 `default`），因此 Release 附件使用 ASCII 文件名。
 
 3. 查看结果：`log.log` 记录每次签到结果，`签到成功.png` 是签到后的页面截图。
 

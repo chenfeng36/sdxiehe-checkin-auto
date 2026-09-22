@@ -46,6 +46,11 @@ else:
     this_file_name=os.path.basename(__file__)
 
 maxRetryTimes=40        #“不在签到范围内”时最多重试次数（每次等 10 秒，40 次 ≈ 6.7 分钟）
+login_wait_timeout=300  #等待登录完成的最长时间（秒），超时视为登录失败
+
+LOGIN_PAGE_TITLE="统一身份认证平台"   #统一身份认证页标题（cookie 失效时会跳到这里）
+#登录失败时页面上可能出现的提示文字，检测到就提前结束等待（只用于自动登录场景）
+LOGIN_ERROR_HINTS=["用户名或密码错误","密码错误","账号或密码错误","账号不存在","认证失败"]
 
 checkIn_URL="https://xg.sdxiehe.edu.cn/xsfw/sys/swmzncqapp/*default/index.do?/xscq/kqqdx#/xscq/kqqdx"   #智能查寝页面
 
@@ -627,6 +632,55 @@ def click_checkin_button(page: Page, label, text: str) -> bool:
 """---------------------------------------------------------------------------------------------------------------------------"""
 # ==================== 主流程 ====================
 
+# ---------- 登录/按钮状态判断的辅助函数 ----------
+
+def wait_until(condition, timeout, interval=1.0):
+    """轮询等待条件成立（condition 是无参函数），最多等 timeout 秒
+
+    Returns:
+        bool: 条件是否成立（超时后返回最后一次判断结果）
+    """
+    deadline=time.time()+timeout
+    while time.time()<deadline:
+        if condition():
+            return True
+        time.sleep(interval)
+    return bool(condition())
+
+def is_auth_page(page):
+    """是否还停留在统一身份认证页（cookie 失效或登录未完成）
+
+    标题为主信号；站点改版导致标题变化时，用登录表单是否可见兜底（只增加敏感性，不减少）。
+    """
+    try:
+        if page.title()==LOGIN_PAGE_TITLE:
+            return True
+        return page.locator("#login_submit").first.is_visible()
+    except Exception:
+        return False
+
+def find_login_error(page):
+    """页面上是否出现登录失败提示，返回命中的提示文字；没有则返回空字符串"""
+    try:
+        content=page.content()
+    except Exception:
+        return ""
+    for hint in LOGIN_ERROR_HINTS:
+        if hint in content:
+            return hint
+    return ""
+
+def normalize_label(text):
+    """归一化按钮文案：去掉半角/全角空格，便于宽容匹配"""
+    return text.replace(" ","").replace("\u3000","")
+
+def is_checkin_text(text):
+    """按钮文案是否属于“可点击的签到按钮”（精确或带后缀，如“签到（剩余 1 次）”）"""
+    normalized=normalize_label(text)
+    return (normalized in ("签到","晚归签到")
+            or normalized.startswith("签到")
+            or normalized.startswith("晚归签到"))
+
 def prepare_config():
     """读取配置；缺失或损坏时生成模板并退出（首次运行流程）
 
@@ -675,13 +729,16 @@ def create_context(browser, config):
 
 
 def ensure_login(page, context, config):
-    """检查登录状态：cookie 有效直接返回；失效则自动登录（含滑块验证码/手动登录提醒）"""
+    """检查登录状态：cookie 有效直接返回 True；失效则自动登录（含滑块验证码/手动登录提醒）
+
+    Returns:
+        bool: 登录是否完成（False=账号密码错误或等待超时，本次不应继续签到）
+    """
     print("浏览器页面标题:", page.title())
 
-    #检查cookie是否可用,如果不可用，则会进入此处理流程
-    #统一身份认证平台 该标题说明cookie过期
-    if(page.title()!="统一身份认证平台"):
-        return
+    #统一身份认证平台 该标题/登录表单说明cookie过期
+    if(not is_auth_page(page)):
+        return True
     # ---------- cookie 失效 → 自动登录 ----------
     page.click("#userNameLogin_a")#自动点击登陆选项卡
     time.sleep(1)
@@ -693,7 +750,9 @@ def ensure_login(page, context, config):
         page.fill("#password",config.password)
         time.sleep(1)
         page.click("#login_submit")
-        time.sleep(1)
+        #等验证码出现或页面开始跳转（最多 3 秒，出现哪种都继续）
+        wait_until(lambda: (not is_auth_page(page)) or page.locator("div.slider").count()>0,
+                   timeout=3, interval=0.5)
         if(not config.monkey_verify):
             #不自动过验证码：弹一个系统通知，提醒用户去浏览器里手动拖滑块
             try:
@@ -721,14 +780,27 @@ def ensure_login(page, context, config):
 
     if os.path.exists(state_file_name):
         os.remove(state_file_name)
-    #等待登录完成：手动登录时脚本会一直在这里等，直到页面跳走
-    while(page.title()=="统一身份认证平台"):
-        time.sleep(5)
+
+    #等待登录完成：手动登录时在这里等用户操作；自动登录账号密码错误时，
+    #页面上会出现错误提示，检测到就立即结束等待；等待超过 login_wait_timeout 秒也算失败
+    start_time=time.time()
+    while is_auth_page(page):
+        if config.has_credentials:
+            error_hint=find_login_error(page)
+            if error_hint:
+                print("检测到登录失败提示["+error_hint+"]，请检查 config.json 里的账号密码")
+                return False
+        if time.time()-start_time>login_wait_timeout:
+            print("等待登录超时（超过 %d 秒），放弃本次签到" % login_wait_timeout)
+            return False
+        time.sleep(2)
+
     #登录成功后立即保存cookie，避免下次运行还要重新登录
     context.storage_state(path=state_file_name)
     if(config.has_credentials):
         save_login_account(config.username)#记录该登录状态属于哪个账号
     print("已保存登录状态到 "+state_file_name)
+    return True
 
 
 def do_checkin(page, context, config):
@@ -771,7 +843,7 @@ def do_checkin(page, context, config):
             print("未找到签到按钮元素")
             return "签到失败"
 
-        #优先选择“签到”，其次“晚归签到”
+        #优先选择“签到”，其次“晚归签到”（先精确匹配）
         target=None
         for priority in ["签到","晚归签到"]:
             for item in candidates:
@@ -781,11 +853,18 @@ def do_checkin(page, context, config):
             if target is not None:
                 break
         if target is None:
+            #没有精确匹配：宽容匹配（文案可能带后缀/空格，如“签到（剩余 1 次）”）
+            for item in candidates:
+                if is_checkin_text(item[0]):
+                    target=item
+                    break
+        if target is None:
             target=candidates[0]
         text,label=target
+        normalized=normalize_label(text)
 
-        #根据按钮文案决定下一步：
-        if(text=="不在签到范围内"):
+        #根据按钮文案决定下一步（宽容匹配，兼容带空格/后缀的文案）：
+        if("不在签到范围内" in normalized):
             #还没到签到时间段（比如还没到查寝时间），等 10 秒后再看一次
             if(retryTimes>maxRetryTimes and maxRetryTimes>=0):
                 print("抵达最大尝试次数,停止尝试签到")
@@ -793,24 +872,28 @@ def do_checkin(page, context, config):
             retryTimes+=1
             print("未到签到时间，等待...")
             time.sleep(10)
-        elif(text=="签到" or text=="晚归签到"):
+        elif(is_checkin_text(text)):
             if(dry_run):
                 #试运行模式：验证“能不能找到按钮”这条链路，不真的点击
                 print("试运行模式(CHECKIN_DRY_RUN=1)：检测到可签到按钮["+text+"]，跳过点击")
                 return "试运行未点击"
             time.sleep(5)               #点之前稍等，让页面渲染完
-            if(click_checkin_button(page,label,text)):
-                result="签到成功"
-            else:
+            clicked=click_checkin_button(page,label,text)
+            time.sleep(5)               #点完后等页面响应，再检查按钮状态
+            if(not clicked):
                 print("签到失败-[未能点击签到按钮]")
-                result="签到失败"
-            time.sleep(5)               #点完后等页面响应，再打印最新按钮状态
+                return "签到失败"
+            #点击后再看一次按钮：按钮消失/文案变化才算确认签到成功
             try:
-                print("点击后按钮状态:"+str([t for t,_ in get_checkin_labels(page)]))
+                remaining=[t for t,_ in get_checkin_labels(page)]
             except Exception:
-                pass
+                remaining=[]
+            print("点击后按钮状态:"+str(remaining))
+            if any(is_checkin_text(t) for t in remaining):
+                print("点击后签到按钮仍在，无法确认签到结果")
+                return "已点击未确认"
             print("处于签到时间内,已签到")
-            return result
+            return "签到成功"
         else:
             print("错误的文本:")
             print("按钮数值结果获取:"+str([t for t,_ in candidates]))
@@ -877,14 +960,16 @@ def auto_checkin():
                 page = context.new_page()#开启浏览器界面
                 page.goto(checkIn_URL)
                 time.sleep(2)
-                ensure_login(page, context, config)
+                if ensure_login(page, context, config):
+                    # ---------- 第 4 步：定位签到按钮并完成签到 ----------
+                    result = do_checkin(page, context, config)
 
-                # ---------- 第 4 步：定位签到按钮并完成签到 ----------
-                result = do_checkin(page, context, config)
-
-                #保存cookie：下次运行就不用再登录了
-                context.storage_state(path=state_file_name)
-                print("已完成签到流程，请注意查看结果")
+                    #保存cookie：下次运行就不用再登录了
+                    context.storage_state(path=state_file_name)
+                    print("已完成签到流程，请注意查看结果")
+                else:
+                    result="登录失败"
+                    print("登录未完成，本次跳过签到步骤")
             except Exception as e:
                 traceback.print_exc()
                 error_text="运行异常: %s: %s"%(type(e).__name__,e)

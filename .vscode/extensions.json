@@ -1,0 +1,15 @@
+{
+    // 本项目实际需要的扩展
+    "recommendations": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy",
+        "ms-python.vscode-python-envs"
+    ],
+    // 已安装但与本项目无关的扩展（仅抑制推荐提示，真正禁用见扩展视图的“禁用（工作区）”）
+    "unwantedRecommendations": [
+        "ritwickdey.liveserver",
+        "ms-vsliveshare.vsliveshare",
+        "redhat.vscode-rsp-ui"
+    ]
+}

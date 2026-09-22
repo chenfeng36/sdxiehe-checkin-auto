@@ -94,6 +94,7 @@ python autoCheckIn.py --dry-run
 .venv\Scripts\pyinstaller.exe --noconfirm --onefile --console --name "自动签到" `
     --collect-all playwright --collect-all win10toast `
     --hidden-import win32console --hidden-import win32timezone --hidden-import pkg_resources `
+    --hidden-import win32api --hidden-import win32event `
     autoCheckIn.py
 ```
 

@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['win32console', 'win32timezone', 'pkg_resources']
+hiddenimports = ['win32console', 'win32timezone', 'pkg_resources', 'win32api', 'win32event']
 tmp_ret = collect_all('playwright')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('win10toast')

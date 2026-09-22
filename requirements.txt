@@ -1,0 +1,5 @@
+playwright
+win10toast
+pywin32
+numpy
+setuptools<81

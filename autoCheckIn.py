@@ -7,25 +7,30 @@
 # 运行方式：
 #   .venv\Scripts\python.exe autoCheckIn.py     #源码方式运行
 #   dist\自动签到.exe                            #打包后双击运行
-#   环境变量 CHECKIN_DRY_RUN=1                   #只检测按钮不点击，用于安全试运行
+#   python autoCheckIn.py --dry-run             #只检测按钮不点击，用于安全试运行
+#   python autoCheckIn.py --headless            #无头模式（不显示浏览器窗口）
+#   （环境变量 CHECKIN_DRY_RUN=1 同样可以开启试运行模式）
+#
+# 退出码：0=成功/已签到；1=失败/异常；2=配置缺失（已生成模板）；3=未到签到时间
 #
 # 生成/使用的文件（都在脚本或 exe 所在目录）：
-#   config.json        账号、密码、经纬度、monkey_verify（是否自动过验证码）；首次运行自动生成模板
+#   config.json        账号、密码、经纬度、monkey_verify、checkin_url 等配置；首次运行自动生成模板
 #   login.json         浏览器登录状态(cookie)；登录成功后自动保存，下次运行免登录
 #   login_account.txt  记录 login.json 属于哪个账号，防止换账号后误用旧 cookie
-#   log.log            每次运行结果的日志（每行前面带日期）
+#   log.log            每次运行结果的日志（每行：时间 | 账号 | 结果 | 用时）
 #   日期_<签到结果>.png  每次运行结束时的页面截图（如“2026-09-22_签到成功.png”）
 #
 # 代码结构（从上到下）：
-#   1. 全局配置与文件路径（最顶部一段）
+#   1. 配置与常量（Config 类 / 默认值 / 文件路径）
 #   2. 工具函数：控制台最小化 / 日志 / config.json 读写
 #   3. CaptchaSolver 类：滑块验证码（本地图像算法，纯 numpy，不依赖 OpenCV）
 #   4. 外部接口：verify() / get_checkin_labels() / click_checkin_button()
-#   5. auto_checkin()：主流程（见文末，带分步注释）
+#   5. 主流程：prepare_config / ensure_login / do_checkin / finalize / auto_checkin
 # =====================================================================================
 from dataclasses import dataclass
 from playwright.sync_api import sync_playwright, Geolocation, Page
 from win10toast import ToastNotifier
+import argparse
 import os
 import sys
 import time
@@ -49,14 +54,14 @@ else:
     base_dir=os.path.dirname(os.path.abspath(__file__))
     this_file_name=os.path.basename(__file__)
 
-maxRetryTimes=40        #“不在签到范围内”时最多重试次数（每次等 10 秒，40 次 ≈ 6.7 分钟）
-login_wait_timeout=300  #等待登录完成的最长时间（秒），超时视为登录失败
+#以下三项是 config.json 里可配置项的默认值（旧配置没写这些键时用默认值）
+DEFAULT_CHECKIN_URL="https://xg.sdxiehe.edu.cn/xsfw/sys/swmzncqapp/*default/index.do?/xscq/kqqdx#/xscq/kqqdx"   #智能查寝页面
+DEFAULT_MAX_RETRY_TIMES=40      #“不在签到范围内”时最多重试次数（每次等 10 秒，40 次 ≈ 6.7 分钟）
+DEFAULT_LOGIN_WAIT_TIMEOUT=300  #等待登录完成的最长时间（秒），超时视为登录失败
 
 LOGIN_PAGE_TITLE="统一身份认证平台"   #统一身份认证页标题（cookie 失效时会跳到这里）
 #登录失败时页面上可能出现的提示文字，检测到就提前结束等待（只用于自动登录场景）
 LOGIN_ERROR_HINTS=["用户名或密码错误","密码错误","账号或密码错误","账号不存在","认证失败"]
-
-checkIn_URL="https://xg.sdxiehe.edu.cn/xsfw/sys/swmzncqapp/*default/index.do?/xscq/kqqdx#/xscq/kqqdx"   #智能查寝页面
 
 file_encoding='utf-8'   #所有读写文件统一用 utf-8
 
@@ -81,6 +86,9 @@ class Config:
     longitude: float = DEFAULT_LONGITUDE
     latitude: float = DEFAULT_LATITUDE
     monkey_verify: bool = False
+    checkin_url: str = DEFAULT_CHECKIN_URL
+    max_retry_times: int = DEFAULT_MAX_RETRY_TIMES
+    login_wait_timeout: int = DEFAULT_LOGIN_WAIT_TIMEOUT
 
     @property
     def has_credentials(self) -> bool:
@@ -88,8 +96,9 @@ class Config:
         return self.username != UNKNOWN and self.password != UNKNOWN
 
 
-#设置环境变量 CHECKIN_DRY_RUN=1 后，只检测签到按钮不点击，用于安全试运行
+#设置环境变量 CHECKIN_DRY_RUN=1（或命令行 --dry-run）后，只检测签到按钮不点击，用于安全试运行
 dry_run = os.environ.get("CHECKIN_DRY_RUN")=="1"
+headless = False    #是否无头模式运行（命令行 --headless 参数开启）
 
 state_file_name=os.path.join(base_dir,"login.json")            #浏览器登录状态(cookie)
 config_file_name=os.path.join(base_dir,"config.json")          #账号密码等配置
@@ -117,12 +126,11 @@ def minimize_self_window():
             pass
 
 def write_log(content):
-    """把一行结果追加写入 log.log（行首自动加当天日期），失败时返回 False"""
+    """把一行结果追加写入 log.log（行首加“年-月-日 时:分:秒”），失败时返回 False"""
     try:
-        now=time.localtime()
-        date_text="%d.%d.%d"%(now.tm_year,now.tm_mon,now.tm_mday)
+        stamp=time.strftime("%Y-%m-%d %H:%M:%S")
         with open(log_file_name,"a",encoding=file_encoding) as file:
-            file.write(date_text+"-"+content+"\n")
+            file.write(stamp+" | "+content+"\n")
         return True
     except Exception:
         print("日志写入失败")
@@ -182,6 +190,19 @@ def _to_bool(value):
         return value
     return str(value).strip().lower() in ("true","1","yes","on")
 
+def _to_int(value, default):
+    """安全转 int：空值/None/非法文本都返回默认值"""
+    try:
+        return int(value)
+    except (TypeError,ValueError):
+        return default
+
+def _to_str(value, default):
+    """安全取字符串：空值/None/非字符串返回默认值"""
+    if isinstance(value,str) and value.strip():
+        return value.strip()
+    return default
+
 def load_config():
     """读取 config.json
 
@@ -218,6 +239,9 @@ def load_config():
         longitude=_to_float(location.get("longitude"),DEFAULT_LONGITUDE),
         latitude=_to_float(location.get("latitude"),DEFAULT_LATITUDE),
         monkey_verify=_to_bool(data.get("monkey_verify",False)),
+        checkin_url=_to_str(data.get("checkin_url"),DEFAULT_CHECKIN_URL),
+        max_retry_times=_to_int(data.get("max_retry_times"),DEFAULT_MAX_RETRY_TIMES),
+        login_wait_timeout=_to_int(data.get("login_wait_timeout"),DEFAULT_LOGIN_WAIT_TIMEOUT),
     )
 
 def save_config(config):
@@ -235,6 +259,9 @@ def save_config(config):
             "latitude": str(config.latitude),
         },
         "monkey_verify": config.monkey_verify,
+        "checkin_url": config.checkin_url,
+        "max_retry_times": config.max_retry_times,
+        "login_wait_timeout": config.login_wait_timeout,
         "expired": {"year": now.tm_year, "month": now.tm_mon, "day": now.tm_mday},
     }
     try:
@@ -792,8 +819,8 @@ def ensure_login(page, context, config):
             if error_hint:
                 print("检测到登录失败提示["+error_hint+"]，请检查 config.json 里的账号密码")
                 return False
-        if time.time()-start_time>login_wait_timeout:
-            print("等待登录超时（超过 %d 秒），放弃本次签到" % login_wait_timeout)
+        if time.time()-start_time>config.login_wait_timeout:
+            print("等待登录超时（超过 %d 秒），放弃本次签到" % config.login_wait_timeout)
             return False
         time.sleep(2)
 
@@ -826,7 +853,7 @@ def do_checkin(page, context, config):
     #页面同时存在“签到”“晚归签到”等多个同类元素，必须 count()+nth() 逐个取，
     #直接用 page.locator(...) 调用 is_visible()/click() 会触发 strict mode 异常导致脚本崩溃
     #循环观察按钮文案（每轮重新扫一遍页面）：
-    #  “不在签到范围内”→ 没到时间，等 10 秒再看（最多 maxRetryTimes 次）
+    #  “不在签到范围内”→ 没到时间，等 10 秒再看（最多 max_retry_times 次）
     #  “签到”/“晚归签到” → 点击签到（试运行模式下跳过点击）
     #  没有按钮        → 可能今天已经签过（看页面上的“归宿记录”关键字）
     retryTimes=0
@@ -868,8 +895,8 @@ def do_checkin(page, context, config):
         #根据按钮文案决定下一步（宽容匹配，兼容带空格/后缀的文案）：
         if("不在签到范围内" in normalized):
             #还没到签到时间段（比如还没到查寝时间），等 10 秒后再看一次
-            #maxRetryTimes 为负数时表示无限重试（一直等到能签到为止）
-            if(maxRetryTimes>=0 and retryTimes>maxRetryTimes):
+            #max_retry_times 为负数时表示无限重试（一直等到能签到为止）
+            if(config.max_retry_times>=0 and retryTimes>config.max_retry_times):
                 print("抵达最大尝试次数,停止尝试签到")
                 return "未到签到时间"    #给个结果，避免截图文件名变成空的 .png
             retryTimes+=1
@@ -918,13 +945,25 @@ def capture_screenshot(page, result):
         return ""
 
 
-def finalize(page, config, result, error_text=""):
+def finalize(page, config, result, error_text="", elapsed=0.0):
     """收尾留痕：写回配置、写日志、截图（无论签到成功还是中途异常都会执行）"""
     save_config(config)
-    log_text=result+(" | "+error_text if error_text else "")
+    account_text=config.username if config.has_credentials else "手动登录"
+    log_text="账号[%s] | %s | 用时 %.1f 秒"%(account_text, result, elapsed)
+    if error_text:
+        log_text+=" | "+error_text
     write_log(log_text)
     if page is not None:
         capture_screenshot(page, result)
+
+
+def exit_code_for(result):
+    """把签到结果映射为进程退出码（0=成功类；3=未到签到时间；其他=失败/异常）"""
+    if result in ("签到成功","已签到","试运行未点击","已点击未确认"):
+        return 0
+    if result=="未到签到时间":
+        return 3
+    return 1
 
 
 def auto_checkin():
@@ -936,7 +975,7 @@ def auto_checkin():
 
     config=prepare_config()
     if config is None:
-        return 0
+        return 2    #配置缺失/损坏，已生成模板（退出码 2）
 
     #login.json 若是别的账号留下的登录状态，先删掉，避免用错账号签到
     if(config.has_credentials and os.path.exists(state_file_name)):
@@ -948,6 +987,7 @@ def auto_checkin():
 
     result="未知结果"
     error_text=""
+    start_time=time.time()     #用于日志里记录本次耗时
     page=None
     browser=None
     # ---------- 第 2 步：启动浏览器（用本机安装的 Edge，无需 playwright install） ----------
@@ -955,13 +995,13 @@ def auto_checkin():
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 channel="msedge",    # 指定使用 Edge
-                headless=False       # 设为 True 则无头模式运行
+                headless=headless    # 默认 False；命令行 --headless 可开无头模式
             )
             try:
                 # ---------- 第 3 步：打开签到页，确保登录（含验证码） ----------
                 context = create_context(browser, config)
                 page = context.new_page()#开启浏览器界面
-                page.goto(checkIn_URL)
+                page.goto(config.checkin_url)
                 #等页面标题渲染出来再判断登录状态（最多 5 秒，超时也继续）
                 wait_until(lambda: page.title()!="", timeout=5, interval=0.5)
                 if ensure_login(page, context, config):
@@ -981,7 +1021,7 @@ def auto_checkin():
                     result="运行异常"
             finally:
                 #收尾留痕：无论成功失败都要写配置/写日志/截图，且必须在关闭浏览器前执行
-                finalize(page, config, result, error_text)
+                finalize(page, config, result, error_text, time.time()-start_time)
                 if not error_text:
                     time.sleep(10)     #留时间给用户看结果，再关浏览器
                 try:
@@ -991,12 +1031,23 @@ def auto_checkin():
     except Exception as e:
         #playwright 启动失败等极端情况：至少留下一条日志
         traceback.print_exc()
-        finalize(None, config, "运行异常", "运行异常: %s: %s"%(type(e).__name__,e))
-    return 0
+        finalize(None, config, "运行异常", "运行异常: %s: %s"%(type(e).__name__,e), time.time()-start_time)
+        result="运行异常"
+    return exit_code_for(result)
 
 
 
 _single_instance_mutex=None   #单实例互斥体句柄（模块级持有，防止被回收导致失效）
+
+
+def parse_args():
+    """解析命令行参数（环境变量 CHECKIN_DRY_RUN=1 仍然有效）"""
+    parser=argparse.ArgumentParser(description="智能查寝自动签到（山东协和学院）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="只检测签到按钮不点击，用于安全试运行（等价于 CHECKIN_DRY_RUN=1）")
+    parser.add_argument("--headless", action="store_true",
+                        help="无头模式运行，不显示浏览器窗口")
+    return parser.parse_args()
 
 
 def is_already_running():
@@ -1013,14 +1064,20 @@ def is_already_running():
 
 if __name__ == "__main__":
     #只有直接运行本文件才会执行（被 import 时不执行）
+    args=parse_args()
+    dry_run=dry_run or args.dry_run   #模块级赋值：命令行参数与环境变量都支持
+    headless=args.headless
     if is_already_running():
         print("检测到已有实例正在运行，本次启动直接退出（避免两个窗口互相干扰）")
         if getattr(sys, "frozen", False) and sys.stdin.isatty():
             input("按回车键退出...")
         sys.exit(0)
+    code=0
     try:
-        auto_checkin()
+        code=auto_checkin()
     except Exception:
         traceback.print_exc()
+        code=1
         if getattr(sys, "frozen", False) and sys.stdin.isatty():
             input("程序出现异常，按回车键退出...")#双击 exe 运行时防止窗口一闪而过，方便看报错
+    sys.exit(code)

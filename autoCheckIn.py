@@ -24,13 +24,17 @@
 #   5. auto_checkin()：主流程（见文末，带分步注释）
 # =====================================================================================
 from dataclasses import dataclass
-from playwright.sync_api import sync_playwright, Geolocation
+from playwright.sync_api import sync_playwright, Geolocation, Page
 from win10toast import ToastNotifier
 import os
 import sys
 import time
 import traceback
 import json
+import random
+import win32api
+import win32event
+import winerror
 import win32gui
 import win32con
 import base64
@@ -242,8 +246,6 @@ def save_config(config):
         return False
 
 # ==================== 滑块验证码处理（本地图像算法，纯 numpy） ====================
-from playwright.sync_api import Page
-import random
 
 
 class CaptchaSolver:
@@ -629,7 +631,7 @@ def click_checkin_button(page: Page, label, text: str) -> bool:
             print("备用选择器点击失败:"+selector+" "+str(e))
     return False
 
-"""---------------------------------------------------------------------------------------------------------------------------"""
+# ---------------------------------------------------------------------------------------------------------------------------
 # ==================== 主流程 ====================
 
 # ---------- 登录/按钮状态判断的辅助函数 ----------
@@ -815,7 +817,7 @@ def do_checkin(page, context, config):
     "latitude": config.latitude,
     }
     context.set_geolocation(geolocation)
-    if page.locator('.van-icon-replay').first.is_visible()==True:
+    if page.locator('.van-icon-replay').first.is_visible():
         page.locator('.van-icon-replay').first.click()#刷新地址，确保定位正确
 
     time.sleep(1)                 #签到成功时候会出现报错的情况----找不到按钮
@@ -866,7 +868,8 @@ def do_checkin(page, context, config):
         #根据按钮文案决定下一步（宽容匹配，兼容带空格/后缀的文案）：
         if("不在签到范围内" in normalized):
             #还没到签到时间段（比如还没到查寝时间），等 10 秒后再看一次
-            if(retryTimes>maxRetryTimes and maxRetryTimes>=0):
+            #maxRetryTimes 为负数时表示无限重试（一直等到能签到为止）
+            if(maxRetryTimes>=0 and retryTimes>maxRetryTimes):
                 print("抵达最大尝试次数,停止尝试签到")
                 return "未到签到时间"    #给个结果，避免截图文件名变成空的 .png
             retryTimes+=1
@@ -959,7 +962,8 @@ def auto_checkin():
                 context = create_context(browser, config)
                 page = context.new_page()#开启浏览器界面
                 page.goto(checkIn_URL)
-                time.sleep(2)
+                #等页面标题渲染出来再判断登录状态（最多 5 秒，超时也继续）
+                wait_until(lambda: page.title()!="", timeout=5, interval=0.5)
                 if ensure_login(page, context, config):
                     # ---------- 第 4 步：定位签到按钮并完成签到 ----------
                     result = do_checkin(page, context, config)
@@ -992,12 +996,31 @@ def auto_checkin():
 
 
 
+_single_instance_mutex=None   #单实例互斥体句柄（模块级持有，防止被回收导致失效）
+
+
+def is_already_running():
+    """是否已有另一个实例在运行（用命名互斥体判断）"""
+    global _single_instance_mutex
+    try:
+        #pywin32-stubs 把首个参数标成必填，实际 API 允许传 None（默认安全属性），这里忽略类型警告
+        _single_instance_mutex=win32event.CreateMutex(None, False, "qiandao_auto_single_instance")  # type: ignore
+        return win32api.GetLastError()==winerror.ERROR_ALREADY_EXISTS
+    except Exception as e:
+        print("单实例检查失败（忽略，继续运行）：%s"%e)
+        return False    #互斥体不可用时（极端情况）不阻塞运行
+
+
 if __name__ == "__main__":
     #只有直接运行本文件才会执行（被 import 时不执行）
+    if is_already_running():
+        print("检测到已有实例正在运行，本次启动直接退出（避免两个窗口互相干扰）")
+        if getattr(sys, "frozen", False) and sys.stdin.isatty():
+            input("按回车键退出...")
+        sys.exit(0)
     try:
         auto_checkin()
     except Exception:
-        import traceback
         traceback.print_exc()
-        if getattr(sys, "frozen", False):
+        if getattr(sys, "frozen", False) and sys.stdin.isatty():
             input("程序出现异常，按回车键退出...")#双击 exe 运行时防止窗口一闪而过，方便看报错

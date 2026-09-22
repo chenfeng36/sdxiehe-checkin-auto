@@ -23,6 +23,7 @@
 #   4. 外部接口：verify() / get_checkin_labels() / click_checkin_button()
 #   5. autoCheckIn()：主流程（见文末，带分步注释）
 # =====================================================================================
+from dataclasses import dataclass
 from playwright.sync_api import sync_playwright, Geolocation
 from win10toast import ToastNotifier
 import os
@@ -45,10 +46,6 @@ else:
 
 maxRetryTimes=40        #“不在签到范围内”时最多重试次数（每次等 10 秒，40 次 ≈ 6.7 分钟）
 
-success=True            #老式三态返回值：成功
-failure=False           #失败
-unknow="unknow"         #未填写（config.json 里没填账号/密码时的占位值）
-
 checkIn_result=""       #本次运行的结果文字，会用作日志内容和截图文件名
 
 checkIn_URL="https://xg.sdxiehe.edu.cn/xsfw/sys/swmzncqapp/*default/index.do?/xscq/kqqdx#/xscq/kqqdx"   #智能查寝页面
@@ -57,13 +54,30 @@ file_encoding='utf-8'   #所有读写文件统一用 utf-8
 
 #定位（经纬度）：默认值为学校坐标，可在 config.json 里修改；
 #签到时会作为浏览器的“虚拟定位”上报，坐标不对页面会显示“不在签到范围内”
-defult_longitude="117.261944"
-defult_latitude="36.739722"
+DEFAULT_LONGITUDE=117.261944   #默认经度（学校坐标）
+DEFAULT_LATITUDE=36.739722     #默认纬度（学校坐标）
 
-longitude=float(defult_longitude)   #实际使用的经纬度（会被 config.json 里的值覆盖）
-latitude=float(defult_latitude)
+#config.json 里“未填写账号/密码”的占位值（历史拼写 unknow，为兼容旧配置保留；读取时也接受 unknown）
+UNKNOWN="unknow"
 
-monkey_verify="false"   #是否自动过滑块验证码："true"=脚本自动破解；"false"=弹系统通知提醒手动过
+
+@dataclass
+class Config:
+    """config.json 对应的运行时配置
+
+    username/password 存明文（文件里的 base64 编解码由 load_config/save_config 负责），
+    未填写时是 UNKNOWN 占位值；monkey_verify=True 表示脚本自动过滑块验证码。
+    """
+    username: str = UNKNOWN
+    password: str = UNKNOWN
+    longitude: float = DEFAULT_LONGITUDE
+    latitude: float = DEFAULT_LATITUDE
+    monkey_verify: bool = False
+
+    @property
+    def has_credentials(self) -> bool:
+        """config.json 里是否填了账号和密码（没填则走手动登录流程）"""
+        return self.username != UNKNOWN and self.password != UNKNOWN
 
 
 #设置环境变量 CHECKIN_DRY_RUN=1 后，只检测签到按钮不点击，用于安全试运行
@@ -74,16 +88,6 @@ config_file_name=os.path.join(base_dir,"config.json")          #账号密码等�
 log_file_name=os.path.join(base_dir,"log.log")                 #运行日志
 #记录 login.json 这个登录状态属于哪个账号，用于避免换账号后仍用旧cookie签到
 login_account_file_name=os.path.join(base_dir,"login_account.txt")
-
-username=unknow      #内存中的明文账号（config.json 没填时为 "unknow"）
-password=unknow      #内存中的明文密码
-
-raw_username=unknow  #config.json 里的原始写法：明文 或 "#"+base64；写回文件时用这个
-raw_password=unknow
-
-expired="""\"expired\":{\"year\":\"ERROR\",\"month\":\"ERROR\",\"day\":\"ERROR\"}"""   #config.json 缺省占位；读取后保存原值，写回时另填当天日期（不参与流程判断）
-nowTime="%d.%d.%d"%(time.localtime().tm_year,time.localtime().tm_mon,time.localtime().tm_mday)   #日志每行开头加的日期
-location=None   #浏览器定位参数，在 autoCheckIn() 里组装
 
 def minimize_self_window():
     """最小化当前控制台窗口，找不到窗口就忽略，不影响签到流程"""
@@ -104,108 +108,134 @@ def minimize_self_window():
         except Exception:
             pass
 
-def writeLog(content):
-    """把一行结果追加写入 log.log（行首自动加今天日期），失败时返回 failure"""
+def write_log(content):
+    """把一行结果追加写入 log.log（行首自动加当天日期），失败时返回 False"""
     try:
+        now=time.localtime()
+        date_text="%d.%d.%d"%(now.tm_year,now.tm_mon,now.tm_mday)
         with open(log_file_name,"a",encoding=file_encoding) as file:
-            file.write(nowTime+"-"+content+"\n")
-        return success
-    except:
+            file.write(date_text+"-"+content+"\n")
+        return True
+    except Exception:
         print("日志写入失败")
-        return failure
-def loadLoginAccount():
+        return False
+
+def load_login_account():
     """读取 login.json 是哪个账号留下的"""
     try:
         with open(login_account_file_name,"r",encoding=file_encoding) as file:
             return file.read().strip()
-    except:
+    except Exception:
         return ""
 
-def saveLoginAccount(account):
+def save_login_account(account):
     """记录本次登录状态属于哪个账号"""
     try:
         with open(login_account_file_name,"w",encoding=file_encoding) as file:
             file.write(str(account))
-    except:
+    except Exception:
         pass
 
-def loadUserData():
-    """读取 config.json，把账号密码、经纬度等填入全局变量
+def _decode_secret(value, label):
+    """把 config.json 里的账号/密码还原成明文
 
-    返回值：success=读取成功；failure=文件不存在或解析失败（首次运行会走“自动生成模板”分支）
-    关于账号密码的两种写法：明文，或 "#" 开头的 base64。
-    读到明文时会顺手转成 "#"+base64 存进内存，这样后面 writeUserData() 写回的就是编码后的，
-    避免明文密码一直原样躺在 config.json 里。
+    支持两种写法：明文，或 "#" 开头的 base64。
+    空值 / 占位值(unknow) / 解码失败 都按“未填写”处理（返回 UNKNOWN）。
     """
-    global raw_username,raw_password,username,password,this_file_name,file_encoding,defult_longitude,defult_latitude,longitude,latitude,monkey_verify,state_file_name,config_file_name,username,password,expired,success,failure,unknow,checkIn_result,nowtime,checkIn_URL,location
-
-    if(os.path.exists(config_file_name)): #存在config文件，读取保存的内容
-        print(config_file_name+"文件存在")
-        with open(config_file_name, 'r', encoding=file_encoding) as file:
-            json_str = file.read()
-        
-        print(json_str)
+    if not isinstance(value,str) or not value.strip():
+        return UNKNOWN
+    raw=value.strip()
+    if raw in (UNKNOWN,"unknown"):
+        return UNKNOWN
+    if raw.startswith("#"):
         try:
-            data = json.loads(json_str)
-        except:
-            print("发生错误,config.json文件读取失败")
-            os.remove(config_file_name)
-            return failure
-        else:
-            raw_username=data['username']
-            raw_password=data['password']
+            return base64.b64decode(raw[1:]).decode("utf-8")
+        except Exception as e:
+            print("警告：config.json 里的%s(base64)无法解码，按未填写处理（%s）"%(label,e))
+            return UNKNOWN
+    return raw
 
-            expired=data['expired']
-            longitude=float(data['location']['longitude'])
-            latitude=float(data['location']['latitude'])
-            monkey_verify=data['monkey_verify']
+def _encode_secret(value):
+    """账号/密码写回文件时统一编码成 "#"+base64（未填写则原样写占位值）"""
+    if value==UNKNOWN:
+        return UNKNOWN
+    return "#"+base64.b64encode(value.encode("utf-8")).decode("utf-8")
 
-
-            if raw_username!=unknow:
-                if raw_username[0]!='#':#明文账号：直接用，并转成 "#"+base64 准备写回文件
-                    username=raw_username
-                    raw_username='#'+base64.b64encode(raw_username.encode('utf-8')).decode('utf-8')
-                else:#"#"+base64：解码出真实账号
-                    username=base64.b64decode(raw_username[1:]).decode('utf-8')
-
-            if raw_password!=unknow:
-                if raw_password[0]!='#':#明文密码：直接用，并转成 "#"+base64 准备写回文件
-                    password=raw_password
-                    raw_password='#'+base64.b64encode(raw_password.encode('utf-8')).decode('utf-8')
-                else:#"#"+base64：解码出真实密码
-                    password=base64.b64decode(raw_password[1:]).decode('utf-8')
-
-
-            return success
-    else:
-        return failure
-
-def writeUserData():
-    """把当前账号/密码/经纬度等写回 config.json
-
-    写回的是 raw_username/raw_password（通常已是 "#"+base64 形式）；
-    expired 字段总是写当天日期，只是记录“上次运行时间”。
-    """
-    global this_file_name,file_encoding,raw_username,raw_password,expired,defult_longitude,defult_latitude,longitude,latitude,monkey_verify,state_file_name,config_file_name,success,failure,unknow,checkIn_result,nowtime,checkIn_URL,location
+def _to_float(value, default):
+    """安全转 float：空值/None/非法文本都返回默认值"""
     try:
-        with open(config_file_name, 'w', encoding=file_encoding) as file:
-            file.write('''{
-    \"username\":\"%s\",
-    \"password\":\"%s\",
-    \"location\":
-    {
-        \"longitude\":\"%s\",
-        \"latitude\":\"%s\"
-    },
-    \"monkey_verify\":\"%s\",
-    \"expired\":{\"year\":%d,\"month\":%d,\"day\":%d}
-}'''%(raw_username,raw_password,longitude,latitude,monkey_verify,time.localtime().tm_year,time.localtime().tm_mon,time.localtime().tm_mday)
-        )
-    except:
+        return float(value)
+    except (TypeError,ValueError):
+        return default
+
+def _to_bool(value):
+    """兼容 JSON 布尔和 "true"/"false" 字符串两种写法"""
+    if isinstance(value,bool):
+        return value
+    return str(value).strip().lower() in ("true","1","yes","on")
+
+def load_config():
+    """读取 config.json
+
+    返回值：Config 对象；文件不存在或内容损坏时返回 None（主流程会走“生成模板”分支）。
+    损坏的文件不会删除，而是备份为 config.json.broken，方便手动恢复。
+    """
+    if not os.path.exists(config_file_name):
+        return None
+    try:
+        with open(config_file_name,"r",encoding=file_encoding) as file:
+            data=json.load(file)
+        if not isinstance(data,dict):
+            raise ValueError("config.json 根节点不是 JSON 对象")
+    except Exception as e:
+        broken_file=config_file_name+".broken"
+        print("config.json 读取失败：%s"%e)
+        try:
+            if os.path.exists(broken_file):
+                os.remove(broken_file)#只保留最近一次的损坏文件
+            os.replace(config_file_name,broken_file)
+            print("原文件已备份为："+broken_file)
+        except Exception as e2:
+            print("备份损坏的 config.json 失败：%s"%e2)
+        return None
+
+    print(config_file_name+"文件存在")
+
+    location=data.get("location")
+    if not isinstance(location,dict):
+        location={}
+    return Config(
+        username=_decode_secret(data.get("username"),"账号"),
+        password=_decode_secret(data.get("password"),"密码"),
+        longitude=_to_float(location.get("longitude"),DEFAULT_LONGITUDE),
+        latitude=_to_float(location.get("latitude"),DEFAULT_LATITUDE),
+        monkey_verify=_to_bool(data.get("monkey_verify",False)),
+    )
+
+def save_config(config):
+    """把配置写回 config.json
+
+    写回的账号/密码是 "#"+base64 形式（见 _encode_secret）；
+    expired 字段写当天日期（历史字段名，实际含义是“上次运行时间”）。
+    """
+    now=time.localtime()
+    data={
+        "username": _encode_secret(config.username),
+        "password": _encode_secret(config.password),
+        "location": {
+            "longitude": str(config.longitude),
+            "latitude": str(config.latitude),
+        },
+        "monkey_verify": config.monkey_verify,
+        "expired": {"year": now.tm_year, "month": now.tm_mon, "day": now.tm_mday},
+    }
+    try:
+        with open(config_file_name,"w",encoding=file_encoding) as file:
+            json.dump(data,file,ensure_ascii=False,indent=4)
+        return True
+    except Exception:
         print("发生错误,config文件写入失败")
-        return failure
-    else:
-        return success
+        return False
 
 # ==================== 滑块验证码处理（本地图像算法，纯 numpy） ====================
 from playwright.sync_api import Page
@@ -600,7 +630,7 @@ def click_checkin_button(page: Page, label, text: str) -> bool:
 
 def autoCheckIn():
     """签到主流程：读配置 → 启动浏览器 → 登录(含验证码) → 定位签到按钮 → 点击 → 保存结果"""
-    global this_file_name,file_encoding,defult_longitude,defult_latitude,longitude,latitude,monkey_verify,state_file_name,config_file_name,username,password,expired,success,failure,unknow,checkIn_result,nowtime,checkIn_URL,location
+    global checkIn_result
 
     # ---------- 第 1 步：读取 config.json ----------
     print("如果是首次登陆，或者cookie已经过期，请注意重新登陆，cookie过期时间通常为一周")
@@ -608,29 +638,30 @@ def autoCheckIn():
     print("当前窗口名称为:"+this_file_name)
     minimize_self_window()# 最小化窗口
 
-    if(loadUserData()==failure):#不存在config文件
+    config=load_config()
+    if(config is None):#config.json 不存在或已损坏
         print("\a")
-        #保存配置文件
-        writeUserData()
-        print("config文件缺失")
+        #生成配置文件模板（损坏的原文件已被备份为 config.json.broken）
+        save_config(Config())
+        print("config文件缺失或已损坏")
         print("已自动生成配置文件:"+config_file_name)
         print("请打开该文件，把 username / password 填成你的账号密码后重新运行；")
         print("如果保持 unknow，则需要在弹出的浏览器窗口里手动登录。")
         if(os.path.exists(state_file_name)):
             os.remove(state_file_name)#不存在config，直接移除login.json文件
+        config=Config()
     #login.json 若是别的账号留下的登录状态，先删掉，避免用错账号签到
-    if(username!=unknow and os.path.exists(state_file_name)):
-        saved_account=loadLoginAccount()
-        if(saved_account and saved_account!=username):
-            print("注意：login.json 属于账号["+saved_account+"]，与 config.json 的账号["+username+"]不一致")
+    if(config.has_credentials and os.path.exists(state_file_name)):
+        saved_account=load_login_account()
+        if(saved_account and saved_account!=config.username):
+            print("注意：login.json 属于账号["+saved_account+"]，与 config.json 的账号["+config.username+"]不一致")
             print("已删除旧的登录状态，本次将用 config.json 里的账号重新登录")
             os.remove(state_file_name)
     #浏览器的“虚拟定位”：签到系统按定位判断是否在签到范围内，这里上报 config.json 里的经纬度
     geolocation: Geolocation = {
-    "longitude": float(longitude),
-    "latitude": float(latitude),
+    "longitude": config.longitude,
+    "latitude": config.latitude,
     }
-    location=geolocation
 
     # ---------- 第 2 步：启动浏览器（用本机安装的 Edge，无需 playwright install） ----------
     with sync_playwright() as p:
@@ -670,14 +701,14 @@ def autoCheckIn():
             time.sleep(1)
             page.click("#rememberMe")#勾选7天内自动登录
 
-            if(username!=unknow and password!=unknow):#自动输入账号和密码
-                page.fill("#username",username)
+            if(config.has_credentials):#自动输入账号和密码
+                page.fill("#username",config.username)
                 time.sleep(1)
-                page.fill("#password",password)
+                page.fill("#password",config.password)
                 time.sleep(1)
                 page.click("#login_submit")
                 time.sleep(1)
-                if(monkey_verify=="false"):
+                if(not config.monkey_verify):
                     #不自动过验证码：弹一个系统通知，提醒用户去浏览器里手动拖滑块
                     try:
                         toaster=ToastNotifier()
@@ -709,8 +740,8 @@ def autoCheckIn():
                 time.sleep(5)
             #登录成功后立即保存cookie，避免下次运行还要重新登录
             context.storage_state(path=state_file_name)
-            if(username!=unknow):
-                saveLoginAccount(username)#记录该登录状态属于哪个账号
+            if(config.has_credentials):
+                save_login_account(config.username)#记录该登录状态属于哪个账号
             print("已保存登录状态到 "+state_file_name)
 
 
@@ -804,8 +835,8 @@ def autoCheckIn():
         # ---------- 第 6 步：收尾（保存 cookie / 写回配置 / 写日志 / 截图） ----------
         #保存cookie：下次运行就不用再登录了
         context.storage_state(path=state_file_name)
-        writeUserData()             #把账号、经纬度等写回 config.json
-        writeLog(checkIn_result)    #签到结果写入 log.log
+        save_config(config)         #把账号、经纬度等写回 config.json
+        write_log(checkIn_result)   #签到结果写入 log.log
 
         print("已完成签到流程，请注意查看结果")
         page.screenshot(path=os.path.join(base_dir,"%s.png"%(checkIn_result)))#保存结果

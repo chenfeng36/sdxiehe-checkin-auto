@@ -14,14 +14,14 @@
 #   login.json         浏览器登录状态(cookie)；登录成功后自动保存，下次运行免登录
 #   login_account.txt  记录 login.json 属于哪个账号，防止换账号后误用旧 cookie
 #   log.log            每次运行结果的日志（每行前面带日期）
-#   <签到结果>.png      每次运行结束时的页面截图，文件名就叫签到结果（如“签到成功.png”）
+#   日期_<签到结果>.png  每次运行结束时的页面截图（如“2026-09-22_签到成功.png”）
 #
 # 代码结构（从上到下）：
 #   1. 全局配置与文件路径（最顶部一段）
 #   2. 工具函数：控制台最小化 / 日志 / config.json 读写
 #   3. CaptchaSolver 类：滑块验证码（本地图像算法，纯 numpy，不依赖 OpenCV）
 #   4. 外部接口：verify() / get_checkin_labels() / click_checkin_button()
-#   5. autoCheckIn()：主流程（见文末，带分步注释）
+#   5. auto_checkin()：主流程（见文末，带分步注释）
 # =====================================================================================
 from dataclasses import dataclass
 from playwright.sync_api import sync_playwright, Geolocation
@@ -29,6 +29,7 @@ from win10toast import ToastNotifier
 import os
 import sys
 import time
+import traceback
 import json
 import win32gui
 import win32con
@@ -45,8 +46,6 @@ else:
     this_file_name=os.path.basename(__file__)
 
 maxRetryTimes=40        #“不在签到范围内”时最多重试次数（每次等 10 秒，40 次 ≈ 6.7 分钟）
-
-checkIn_result=""       #本次运行的结果文字，会用作日志内容和截图文件名
 
 checkIn_URL="https://xg.sdxiehe.edu.cn/xsfw/sys/swmzncqapp/*default/index.do?/xscq/kqqdx#/xscq/kqqdx"   #智能查寝页面
 
@@ -544,7 +543,7 @@ def verify(page: Page, max_attempts: int = 10) -> bool:
     """
     验证码处理入口：本地图像算法定位缺口，一次拖到位
 
-    在 autoCheckIn() 里、monkey_verify=="true" 时被调用（登录提交后自动过滑块）。
+    在 ensure_login() 里、monkey_verify 为 true 时被调用（登录提交后自动过滑块）。
 
     Args:
         page: Playwright页面对象
@@ -558,7 +557,7 @@ def verify(page: Page, max_attempts: int = 10) -> bool:
 
 
 def get_checkin_labels(page: Page):
-    """读取页面上可见的签到按钮，返回 [(locator, 文案), ...]
+    """读取页面上可见的签到按钮，返回 [(文案, locator), ...]
 
     注意：页面上会同时存在“签到”和“晚归签到”两个同类元素，
     必须先 count() + nth(i) 逐个取，直接用 page.locator(...) 调用
@@ -570,7 +569,7 @@ def get_checkin_labels(page: Page):
         label = labels.nth(index)
         try:
             if label.is_visible():
-                result.append((label, (label.text_content() or "").strip()))
+                result.append(((label.text_content() or "").strip(), label))
         except Exception:
             continue
     return result
@@ -628,28 +627,231 @@ def click_checkin_button(page: Page, label, text: str) -> bool:
 """---------------------------------------------------------------------------------------------------------------------------"""
 # ==================== 主流程 ====================
 
-def autoCheckIn():
-    """签到主流程：读配置 → 启动浏览器 → 登录(含验证码) → 定位签到按钮 → 点击 → 保存结果"""
-    global checkIn_result
+def prepare_config():
+    """读取配置；缺失或损坏时生成模板并退出（首次运行流程）
 
-    # ---------- 第 1 步：读取 config.json ----------
+    Returns:
+        Config 对象；返回 None 表示配置刚生成，应先让用户填写后再运行
+    """
+    config=load_config()
+    if config is not None:
+        return config
+    print("\a")
+    #生成配置文件模板（损坏的原文件已被备份为 config.json.broken）
+    save_config(Config())
+    print("config文件缺失或已损坏")
+    print("已自动生成配置文件:"+config_file_name)
+    print("请打开该文件，把 username / password 填成你的账号密码后重新运行；")
+    print("如果不填（保持 unknow），重新运行后需要在弹出的浏览器窗口里手动登录。")
+    if os.path.exists(state_file_name):
+        os.remove(state_file_name)#不存在config，直接移除login.json文件
+    #首次运行不再直接打开浏览器，等用户填好配置后重新运行
+    if sys.stdin.isatty():
+        input("按回车键退出...")
+    return None
+
+
+def create_context(browser, config):
+    """新建浏览器上下文：带虚拟定位/时区；有 login.json 则带 cookie 打开（免登录）"""
+    geolocation: Geolocation = {
+    "longitude": config.longitude,
+    "latitude": config.latitude,
+    }
+    #有 login.json 就带着 cookie 打开（免登录），没有则开一个全新会话
+    if os.path.exists(state_file_name):
+        return browser.new_context(
+            storage_state=state_file_name,
+            geolocation=geolocation,
+            locale="zh-Hans-CN",
+            timezone_id="Asia/Shanghai",
+            permissions=["geolocation"],
+        )
+    return browser.new_context(
+        geolocation=geolocation,
+        locale="zh-Hans-CN",
+        timezone_id="Asia/Shanghai",
+        permissions=["geolocation"],
+    )
+
+
+def ensure_login(page, context, config):
+    """检查登录状态：cookie 有效直接返回；失效则自动登录（含滑块验证码/手动登录提醒）"""
+    print("浏览器页面标题:", page.title())
+
+    #检查cookie是否可用,如果不可用，则会进入此处理流程
+    #统一身份认证平台 该标题说明cookie过期
+    if(page.title()!="统一身份认证平台"):
+        return
+    # ---------- cookie 失效 → 自动登录 ----------
+    page.click("#userNameLogin_a")#自动点击登陆选项卡
+    time.sleep(1)
+    page.click("#rememberMe")#勾选7天内自动登录
+
+    if(config.has_credentials):#自动输入账号和密码
+        page.fill("#username",config.username)
+        time.sleep(1)
+        page.fill("#password",config.password)
+        time.sleep(1)
+        page.click("#login_submit")
+        time.sleep(1)
+        if(not config.monkey_verify):
+            #不自动过验证码：弹一个系统通知，提醒用户去浏览器里手动拖滑块
+            try:
+                toaster=ToastNotifier()
+                toaster.show_toast(this_file_name,"请过人机验证",duration=5,threaded=True)
+            except Exception:
+                pass
+        else:
+            #monkey_verify 为 true：用本地图像算法自动过滑块验证码
+            verify_res=verify(page)
+            if(verify_res==False):
+                print("验证失败")
+                if page.title()=="智能查寝":
+                    print("因未知原因未检测到验证通过,但是验证码已经验证完成")
+                    print("开始尝试签到流程")
+            else:
+                print("验证成功")
+    else:
+        #config.json 没填账号密码：弹通知提醒用户在浏览器窗口里手动登录
+        try:
+            toaster=ToastNotifier()
+            toaster.show_toast(this_file_name,"请输入账号和密码",duration=5,threaded=True)
+        except Exception:
+            pass
+
+    if os.path.exists(state_file_name):
+        os.remove(state_file_name)
+    #等待登录完成：手动登录时脚本会一直在这里等，直到页面跳走
+    while(page.title()=="统一身份认证平台"):
+        time.sleep(5)
+    #登录成功后立即保存cookie，避免下次运行还要重新登录
+    context.storage_state(path=state_file_name)
+    if(config.has_credentials):
+        save_login_account(config.username)#记录该登录状态属于哪个账号
+    print("已保存登录状态到 "+state_file_name)
+
+
+def do_checkin(page, context, config):
+    """进入签到页，定位签到按钮并点击（dry_run 模式下只检测不点击）
+
+    Returns:
+        str: 结果文字（签到成功 / 签到失败 / 已签到 / 未到签到时间 / 试运行未点击）
+    """
+    time.sleep(1)
+    geolocation: Geolocation = {
+    "longitude": config.longitude,
+    "latitude": config.latitude,
+    }
+    context.set_geolocation(geolocation)
+    if page.locator('.van-icon-replay').first.is_visible()==True:
+        page.locator('.van-icon-replay').first.click()#刷新地址，确保定位正确
+
+    time.sleep(1)                 #签到成功时候会出现报错的情况----找不到按钮
+
+    #检测签到按钮
+    #页面同时存在“签到”“晚归签到”等多个同类元素，必须 count()+nth() 逐个取，
+    #直接用 page.locator(...) 调用 is_visible()/click() 会触发 strict mode 异常导致脚本崩溃
+    #循环观察按钮文案（每轮重新扫一遍页面）：
+    #  “不在签到范围内”→ 没到时间，等 10 秒再看（最多 maxRetryTimes 次）
+    #  “签到”/“晚归签到” → 点击签到（试运行模式下跳过点击）
+    #  没有按钮        → 可能今天已经签过（看页面上的“归宿记录”关键字）
+    retryTimes=0
+    while True:
+        candidates=get_checkin_labels(page)
+        if not candidates:
+            #没有签到按钮：可能今天已经签过了（页面显示归宿记录），也可能页面结构变了
+            try:
+                content=page.content()
+            except Exception:
+                content=""
+            for keyword in ["正常归宿","归宿时间","已签到","签到成功"]:
+                if keyword in content:
+                    print("页面上没有签到按钮，但已显示["+keyword+"]，视为今日已签到")
+                    return "已签到"
+            print("未找到签到按钮元素")
+            return "签到失败"
+
+        #优先选择“签到”，其次“晚归签到”
+        target=None
+        for priority in ["签到","晚归签到"]:
+            for item in candidates:
+                if item[0]==priority:
+                    target=item
+                    break
+            if target is not None:
+                break
+        if target is None:
+            target=candidates[0]
+        text,label=target
+
+        #根据按钮文案决定下一步：
+        if(text=="不在签到范围内"):
+            #还没到签到时间段（比如还没到查寝时间），等 10 秒后再看一次
+            if(retryTimes>maxRetryTimes and maxRetryTimes>=0):
+                print("抵达最大尝试次数,停止尝试签到")
+                return "未到签到时间"    #给个结果，避免截图文件名变成空的 .png
+            retryTimes+=1
+            print("未到签到时间，等待...")
+            time.sleep(10)
+        elif(text=="签到" or text=="晚归签到"):
+            if(dry_run):
+                #试运行模式：验证“能不能找到按钮”这条链路，不真的点击
+                print("试运行模式(CHECKIN_DRY_RUN=1)：检测到可签到按钮["+text+"]，跳过点击")
+                return "试运行未点击"
+            time.sleep(5)               #点之前稍等，让页面渲染完
+            if(click_checkin_button(page,label,text)):
+                result="签到成功"
+            else:
+                print("签到失败-[未能点击签到按钮]")
+                result="签到失败"
+            time.sleep(5)               #点完后等页面响应，再打印最新按钮状态
+            try:
+                print("点击后按钮状态:"+str([t for t,_ in get_checkin_labels(page)]))
+            except Exception:
+                pass
+            print("处于签到时间内,已签到")
+            return result
+        else:
+            print("错误的文本:")
+            print("按钮数值结果获取:"+str([t for t,_ in candidates]))
+            return "签到失败"
+
+
+def capture_screenshot(page, result):
+    """保存本次运行的结果截图（文件名：日期_结果，如 2026-09-22_签到成功.png）
+
+    截图失败只打印提示，不影响主流程。
+    """
+    try:
+        date_text=time.strftime("%Y-%m-%d")
+        shot_path=os.path.join(base_dir,"%s_%s.png"%(date_text,result))
+        page.screenshot(path=shot_path)
+        return shot_path
+    except Exception as e:
+        print("截图保存失败：%s"%e)
+        return ""
+
+
+def finalize(page, config, result, error_text=""):
+    """收尾留痕：写回配置、写日志、截图（无论签到成功还是中途异常都会执行）"""
+    save_config(config)
+    log_text=result+(" | "+error_text if error_text else "")
+    write_log(log_text)
+    if page is not None:
+        capture_screenshot(page, result)
+
+
+def auto_checkin():
+    """签到主流程（编排）：读配置 → 启动浏览器 → 登录 → 签到 → 收尾留痕"""
+    # ---------- 第 1 步：读取 config.json（缺失时生成模板并退出） ----------
     print("如果是首次登陆，或者cookie已经过期，请注意重新登陆，cookie过期时间通常为一周")
-
     print("当前窗口名称为:"+this_file_name)
     minimize_self_window()# 最小化窗口
 
-    config=load_config()
-    if(config is None):#config.json 不存在或已损坏
-        print("\a")
-        #生成配置文件模板（损坏的原文件已被备份为 config.json.broken）
-        save_config(Config())
-        print("config文件缺失或已损坏")
-        print("已自动生成配置文件:"+config_file_name)
-        print("请打开该文件，把 username / password 填成你的账号密码后重新运行；")
-        print("如果保持 unknow，则需要在弹出的浏览器窗口里手动登录。")
-        if(os.path.exists(state_file_name)):
-            os.remove(state_file_name)#不存在config，直接移除login.json文件
-        config=Config()
+    config=prepare_config()
+    if config is None:
+        return 0
+
     #login.json 若是别的账号留下的登录状态，先删掉，避免用错账号签到
     if(config.has_credentials and os.path.exists(state_file_name)):
         saved_account=load_login_account()
@@ -657,206 +859,58 @@ def autoCheckIn():
             print("注意：login.json 属于账号["+saved_account+"]，与 config.json 的账号["+config.username+"]不一致")
             print("已删除旧的登录状态，本次将用 config.json 里的账号重新登录")
             os.remove(state_file_name)
-    #浏览器的“虚拟定位”：签到系统按定位判断是否在签到范围内，这里上报 config.json 里的经纬度
-    geolocation: Geolocation = {
-    "longitude": config.longitude,
-    "latitude": config.latitude,
-    }
 
+    result="未知结果"
+    error_text=""
+    page=None
+    browser=None
     # ---------- 第 2 步：启动浏览器（用本机安装的 Edge，无需 playwright install） ----------
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            channel="msedge",    # 指定使用 Edge
-            headless=False       # 设为 True 则无头模式运行
-        )
-
-        #有 login.json 就带着 cookie 打开（免登录），没有则开一个全新会话
-        context=None
-        if os.path.exists(state_file_name):#存在cookie，直接使用
-            context = browser.new_context(
-            storage_state=state_file_name,
-            geolocation=geolocation,
-            locale="zh-Hans-CN",
-            timezone_id="Asia/Shanghai",
-            permissions=["geolocation"],
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                channel="msedge",    # 指定使用 Edge
+                headless=False       # 设为 True 则无头模式运行
             )
-        else:#默认无cookie
-            context = browser.new_context(
-            geolocation=geolocation,
-            locale="zh-Hans-CN",
-            timezone_id="Asia/Shanghai",
-            permissions=["geolocation"],
-            )
-        # ---------- 第 3 步：打开签到页，检查登录状态 ----------
-        page = context.new_page()#开启浏览器界面
-        page.goto(checkIn_URL)
-        time.sleep(2)
-        print("浏览器页面标题:", page.title())
+            try:
+                # ---------- 第 3 步：打开签到页，确保登录（含验证码） ----------
+                context = create_context(browser, config)
+                page = context.new_page()#开启浏览器界面
+                page.goto(checkIn_URL)
+                time.sleep(2)
+                ensure_login(page, context, config)
 
-        #检查cookie是否可用,如果不可用，则会进入此处理流程
-        #统一身份认证平台 该标题说明cookie过期
-        if(page.title()=="统一身份认证平台"):
-            # ---------- 第 4 步：cookie 失效 → 自动登录 ----------
-            page.click("#userNameLogin_a")#自动点击登陆选项卡
-            time.sleep(1)
-            page.click("#rememberMe")#勾选7天内自动登录
+                # ---------- 第 4 步：定位签到按钮并完成签到 ----------
+                result = do_checkin(page, context, config)
 
-            if(config.has_credentials):#自动输入账号和密码
-                page.fill("#username",config.username)
-                time.sleep(1)
-                page.fill("#password",config.password)
-                time.sleep(1)
-                page.click("#login_submit")
-                time.sleep(1)
-                if(not config.monkey_verify):
-                    #不自动过验证码：弹一个系统通知，提醒用户去浏览器里手动拖滑块
-                    try:
-                        toaster=ToastNotifier()
-                        toaster.show_toast(this_file_name,"请过人机验证",duration=5,threaded=True)
-                    except:
-                        pass
-                else:
-                    #monkey_verify=="true"：用本地图像算法自动过滑块验证码
-                    verify_res=verify(page)
-                    if(verify_res==False):
-                        print("验证失败")
-                        if page.title()=="智能查寝":
-                            print("因未知原因未检测到验证通过,但是验证码已经验证完成")
-                            print("开始尝试签到流程")
-                    else:
-                        print("验证成功")
-            else:
-                #config.json 没填账号密码：弹通知提醒用户在浏览器窗口里手动登录
+                #保存cookie：下次运行就不用再登录了
+                context.storage_state(path=state_file_name)
+                print("已完成签到流程，请注意查看结果")
+            except Exception as e:
+                traceback.print_exc()
+                error_text="运行异常: %s: %s"%(type(e).__name__,e)
+                if result=="未知结果":
+                    result="运行异常"
+            finally:
+                #收尾留痕：无论成功失败都要写配置/写日志/截图，且必须在关闭浏览器前执行
+                finalize(page, config, result, error_text)
+                if not error_text:
+                    time.sleep(10)     #留时间给用户看结果，再关浏览器
                 try:
-                    toaster=ToastNotifier()
-                    toaster.show_toast(this_file_name,"请输入账号和密码",duration=5,threaded=True)
-                except:
-                    pass
-
-            if os.path.exists(state_file_name):
-                os.remove(state_file_name)
-            #等待登录完成：手动登录时脚本会一直在这里等，直到页面跳走
-            while(page.title()=="统一身份认证平台"):
-                time.sleep(5)
-            #登录成功后立即保存cookie，避免下次运行还要重新登录
-            context.storage_state(path=state_file_name)
-            if(config.has_credentials):
-                save_login_account(config.username)#记录该登录状态属于哪个账号
-            print("已保存登录状态到 "+state_file_name)
-
-
-        # ---------- 第 5 步：进入签到页，定位签到按钮 ----------
-        time.sleep(1)
-        context.set_geolocation(geolocation)
-        if page.locator('.van-icon-replay').first.is_visible()==True:
-            page.locator('.van-icon-replay').first.click()#刷新地址，确保定位正确
-        
-        time.sleep(1)                 #签到成功时候会出现报错的情况----找不到按钮
-
-
-
-        #检测签到按钮
-        #页面同时存在“签到”“晚归签到”等多个同类元素，必须 count()+nth() 逐个取，
-        #直接用 page.locator(...) 调用 is_visible()/click() 会触发 strict mode 异常导致脚本崩溃
-        #循环观察按钮文案（每轮重新扫一遍页面）：
-        #  “不在签到范围内”→ 没到时间，等 10 秒再看（最多 maxRetryTimes 次）
-        #  “签到”/“晚归签到” → 点击签到（试运行模式下跳过点击）
-        #  没有按钮        → 可能今天已经签过（看页面上的“归宿记录”关键字）
-        retryTimes=0
-        while True:
-            candidates=get_checkin_labels(page)
-            if not candidates:
-                #没有签到按钮：可能今天已经签过了（页面显示归宿记录），也可能页面结构变了
-                printed_already=False
-                try:
-                    content=page.content()
-                except Exception:
-                    content=""
-                for keyword in ["正常归宿","归宿时间","已签到","签到成功"]:
-                    if keyword in content:
-                        print("页面上没有签到按钮，但已显示["+keyword+"]，视为今日已签到")
-                        checkIn_result="已签到"
-                        printed_already=True
-                        break
-                if not printed_already:
-                    print("未找到签到按钮元素")
-                    checkIn_result="签到失败"
-                break
-
-            #优先选择“签到”，其次“晚归签到”
-            target=None
-            for priority in ["签到","晚归签到"]:
-                for item in candidates:
-                    if item[1]==priority:
-                        target=item
-                        break
-                if target is not None:
-                    break
-            if target is None:
-                target=candidates[0]
-            label,text=target
-
-            #根据按钮文案决定下一步：
-            if(text=="不在签到范围内"):
-                #还没到签到时间段（比如还没到查寝时间），等 10 秒后再看一次
-                if(retryTimes>maxRetryTimes and maxRetryTimes>=0):
-                    print("抵达最大尝试次数,停止尝试签到")
-                    checkIn_result="未到签到时间"    #给个结果，避免后面截图文件名变成空的 .png
-                    break
-                retryTimes+=1
-                print("未到签到时间，等待...")
-                time.sleep(10)
-            elif(text=="签到" or text=="晚归签到"):
-                if(dry_run):
-                    #试运行模式：验证“能不能找到按钮”这条链路，不真的点击
-                    print("试运行模式(CHECKIN_DRY_RUN=1)：检测到可签到按钮["+text+"]，跳过点击")
-                    checkIn_result="试运行未点击"
-                    break
-                time.sleep(5)               #点之前稍等，让页面渲染完
-                if(click_checkin_button(page,label,text)):
-                    checkIn_result="签到成功"
-                else:
-                    print("签到失败-[未能点击签到按钮]")
-                    checkIn_result="签到失败"
-                time.sleep(5)               #点完后等页面响应，再打印最新按钮状态
-                try:
-                    print("点击后按钮状态:"+str([t for _,t in get_checkin_labels(page)]))
+                    browser.close()
                 except Exception:
                     pass
-                print("处于签到时间内,已签到")
-                
-
-                break
-            else:
-                print("错误的文本:")
-                checkIn_result="签到失败"
-                print("按钮数值结果获取:"+str([t for _,t in candidates]))
-                break
-        # ---------- 第 6 步：收尾（保存 cookie / 写回配置 / 写日志 / 截图） ----------
-        #保存cookie：下次运行就不用再登录了
-        context.storage_state(path=state_file_name)
-        save_config(config)         #把账号、经纬度等写回 config.json
-        write_log(checkIn_result)   #签到结果写入 log.log
-
-        print("已完成签到流程，请注意查看结果")
-        page.screenshot(path=os.path.join(base_dir,"%s.png"%(checkIn_result)))#保存结果
-        print("完成")
-
-
-
-        #os.system("pause")
-
-
-        time.sleep(10)     #等 10 秒再关浏览器，留时间给用户看结果
-        browser.close()
-        return 0
+    except Exception as e:
+        #playwright 启动失败等极端情况：至少留下一条日志
+        traceback.print_exc()
+        finalize(None, config, "运行异常", "运行异常: %s: %s"%(type(e).__name__,e))
+    return 0
 
 
 
 if __name__ == "__main__":
     #只有直接运行本文件才会执行（被 import 时不执行）
     try:
-        autoCheckIn()
+        auto_checkin()
     except Exception:
         import traceback
         traceback.print_exc()

@@ -3,7 +3,9 @@
 # 多账号签到调度器（配合各账号文件夹里的“自动签到.exe”使用）
 #
 # 功能：读取同目录 accounts.txt 里的账号列表，按顺序依次运行每个账号的签到程序；
-#       前一个程序一退出就立即运行下一个（无缝衔接），全部结束后自动退出。
+#       前一个程序一退出就立即运行下一个（无缝衔接）；
+#       全部跑完后如果有账号没成功，会把未成功的账号按顺序再跑（最多重跑 3 轮）；
+#       全部结束后自动退出。
 #
 # 使用：
 #   1. 编辑 accounts.txt，一行一个签到程序的完整路径（# 开头为注释）；
@@ -36,6 +38,7 @@ lock_file_name = os.path.join(base_dir, "调度器运行中.lock")      #防重�
 
 gap_seconds = 3             #两个账号之间的间隔（秒）：留点时间让浏览器完全退出、cookie 写盘
 per_account_timeout = 5*60  #单个账号最长运行时间（秒），超时会强制结束并继续下一个
+max_retry_rounds = 3        #跑完后未成功的账号最多重跑的轮数（0=不重跑）
 
 #签到程序退出码的含义（对应新版“自动签到”；旧版程序只会返回 0）
 exit_code_text = {0:"成功/已签到", 1:"失败/异常", 2:"配置缺失", 3:"未到签到时间"}
@@ -191,26 +194,50 @@ def main():
     write_log("开始批量签到：共 %d 个账号%s" % (len(accounts), "（试运行模式）" if args.dry_run else ""))
 
     start = time.time()
-    failed = []
-    for index, exe_path in enumerate(accounts, 1):
-        _, _, ok = run_account(index, len(accounts), exe_path, extra_args)
-        if not ok:
-            failed.append(exe_path)
-        if index < len(accounts):
-            time.sleep(gap_seconds)     #留一点间隔，让浏览器完全退出
+    succeeded = []          #跑成功过的账号
+    pending = list(accounts)#本轮要跑的账号（首轮=全部，之后=上一轮未成功的）
+    fail_reason = {}        #账号 -> 最后一次失败的原因文字
+    retry_round = 0         #0=首轮；1、2、3=第几次重跑
+    while True:
+        if retry_round > 0:
+            print("=" * 64)
+            print("第 %d 次重跑：还有 %d 个账号未成功，按顺序重跑" % (retry_round, len(pending)))
+            write_log("第 %d 次重跑：%d 个账号（%s）" % (retry_round, len(pending), "、".join(pending)))
+
+        current = pending
+        pending = []
+        for index, exe_path in enumerate(current, 1):
+            result, _, ok = run_account(index, len(current), exe_path, extra_args)
+            if ok:
+                succeeded.append(exe_path)
+                fail_reason.pop(exe_path, None)
+            else:
+                pending.append(exe_path)
+                fail_reason[exe_path] = result
+            if index < len(current):
+                time.sleep(gap_seconds)     #留一点间隔，让浏览器完全退出
+
+        if not pending:
+            break                           #全部成功
+        if retry_round >= max_retry_rounds:
+            break                           #重跑到上限，放弃
+        retry_round += 1
+        time.sleep(gap_seconds)             #重跑轮之间也留一点间隔
 
     total_time = time.time() - start
     print("=" * 64)
     summary = "全部完成：成功 %d / 共 %d，总耗时 %.0f 秒（%.1f 分钟）" % (
-        len(accounts) - len(failed), len(accounts), total_time, total_time / 60.0)
+        len(succeeded), len(accounts), total_time, total_time / 60.0)
+    if retry_round > 0:
+        summary += "，共重跑 %d 次" % retry_round
     print(summary)
     write_log(summary)
-    if failed:
-        print("以下账号没有成功，请到它们各自的文件夹里看 log.log 和截图：")
-        for exe_path in failed:
-            print("  - " + exe_path)
-            write_log("未成功：" + exe_path)
-    return 0 if not failed else 1
+    if pending:
+        print("以下账号重跑后仍未成功，请到它们各自的文件夹里看 log.log 和截图：")
+        for exe_path in pending:
+            print("  - %s（%s）" % (exe_path, fail_reason.get(exe_path, "")))
+            write_log("最终未成功：%s（%s）" % (exe_path, fail_reason.get(exe_path, "")))
+    return 0 if not pending else 1
 
 if __name__ == "__main__":
     #只有直接运行本文件才会执行（被 import 时不执行）

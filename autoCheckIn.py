@@ -1,3 +1,28 @@
+# =====================================================================================
+# 智能查寝 自动签到脚本（山东协和学院 xg.sdxiehe.edu.cn）
+#
+# 功能：用账号密码自动登录统一身份认证平台（cookie 过期时重新登录，可自动过滑块验证码），
+#       进入“智能查寝”页面后自动点击“签到”/“晚归签到”按钮完成签到，并记录结果。
+#
+# 运行方式：
+#   .venv\Scripts\python.exe autoCheckIn.py     #源码方式运行
+#   dist\自动签到.exe                            #打包后双击运行
+#   环境变量 CHECKIN_DRY_RUN=1                   #只检测按钮不点击，用于安全试运行
+#
+# 生成/使用的文件（都在脚本或 exe 所在目录）：
+#   config.json        账号、密码、经纬度、monkey_verify（是否自动过验证码）；首次运行自动生成模板
+#   login.json         浏览器登录状态(cookie)；登录成功后自动保存，下次运行免登录
+#   login_account.txt  记录 login.json 属于哪个账号，防止换账号后误用旧 cookie
+#   log.log            每次运行结果的日志（每行前面带日期）
+#   <签到结果>.png      每次运行结束时的页面截图，文件名就叫签到结果（如“签到成功.png”）
+#
+# 代码结构（从上到下）：
+#   1. 全局配置与文件路径（最顶部一段）
+#   2. 工具函数：控制台最小化 / 日志 / config.json 读写
+#   3. CaptchaSolver 类：滑块验证码（本地图像算法，纯 numpy，不依赖 OpenCV）
+#   4. 外部接口：verify() / get_checkin_labels() / click_checkin_button()
+#   5. autoCheckIn()：主流程（见文末，带分步注释）
+# =====================================================================================
 from playwright.sync_api import sync_playwright, Geolocation
 from win10toast import ToastNotifier
 import os
@@ -18,46 +43,47 @@ else:
     base_dir=os.path.dirname(os.path.abspath(__file__))
     this_file_name=os.path.basename(__file__)
 
-maxRetryTimes=40
+maxRetryTimes=40        #“不在签到范围内”时最多重试次数（每次等 10 秒，40 次 ≈ 6.7 分钟）
 
-success=True
-failure=False
-unknow="unknow"
+success=True            #老式三态返回值：成功
+failure=False           #失败
+unknow="unknow"         #未填写（config.json 里没填账号/密码时的占位值）
 
-checkIn_result=""
+checkIn_result=""       #本次运行的结果文字，会用作日志内容和截图文件名
 
-checkIn_URL="https://xg.sdxiehe.edu.cn/xsfw/sys/swmzncqapp/*default/index.do?/xscq/kqqdx#/xscq/kqqdx"
+checkIn_URL="https://xg.sdxiehe.edu.cn/xsfw/sys/swmzncqapp/*default/index.do?/xscq/kqqdx#/xscq/kqqdx"   #智能查寝页面
 
-file_encoding='utf-8'
+file_encoding='utf-8'   #所有读写文件统一用 utf-8
 
-#经纬度
+#定位（经纬度）：默认值为学校坐标，可在 config.json 里修改；
+#签到时会作为浏览器的“虚拟定位”上报，坐标不对页面会显示“不在签到范围内”
 defult_longitude="117.261944"
 defult_latitude="36.739722"
 
-longitude=float(defult_longitude)
+longitude=float(defult_longitude)   #实际使用的经纬度（会被 config.json 里的值覆盖）
 latitude=float(defult_latitude)
 
-monkey_verify="false"
+monkey_verify="false"   #是否自动过滑块验证码："true"=脚本自动破解；"false"=弹系统通知提醒手动过
 
 
 #设置环境变量 CHECKIN_DRY_RUN=1 后，只检测签到按钮不点击，用于安全试运行
 dry_run = os.environ.get("CHECKIN_DRY_RUN")=="1"
 
-state_file_name=os.path.join(base_dir,"login.json")
-config_file_name=os.path.join(base_dir,"config.json")
-log_file_name=os.path.join(base_dir,"log.log")
+state_file_name=os.path.join(base_dir,"login.json")            #浏览器登录状态(cookie)
+config_file_name=os.path.join(base_dir,"config.json")          #账号密码等配置
+log_file_name=os.path.join(base_dir,"log.log")                 #运行日志
 #记录 login.json 这个登录状态属于哪个账号，用于避免换账号后仍用旧cookie签到
 login_account_file_name=os.path.join(base_dir,"login_account.txt")
 
-username=unknow
-password=unknow
+username=unknow      #内存中的明文账号（config.json 没填时为 "unknow"）
+password=unknow      #内存中的明文密码
 
-raw_username=unknow
+raw_username=unknow  #config.json 里的原始写法：明文 或 "#"+base64；写回文件时用这个
 raw_password=unknow
 
-expired="""\"expired\":{\"year\":\"ERROR\",\"month\":\"ERROR\",\"day\":\"ERROR\"}"""
-nowTime="%d.%d.%d"%(time.localtime().tm_year,time.localtime().tm_mon,time.localtime().tm_mday)
-location=None
+expired="""\"expired\":{\"year\":\"ERROR\",\"month\":\"ERROR\",\"day\":\"ERROR\"}"""   #config.json 缺省占位；读取后保存原值，写回时另填当天日期（不参与流程判断）
+nowTime="%d.%d.%d"%(time.localtime().tm_year,time.localtime().tm_mon,time.localtime().tm_mday)   #日志每行开头加的日期
+location=None   #浏览器定位参数，在 autoCheckIn() 里组装
 
 def minimize_self_window():
     """最小化当前控制台窗口，找不到窗口就忽略，不影响签到流程"""
@@ -79,6 +105,7 @@ def minimize_self_window():
             pass
 
 def writeLog(content):
+    """把一行结果追加写入 log.log（行首自动加今天日期），失败时返回 failure"""
     try:
         with open(log_file_name,"a",encoding=file_encoding) as file:
             file.write(nowTime+"-"+content+"\n")
@@ -103,6 +130,13 @@ def saveLoginAccount(account):
         pass
 
 def loadUserData():
+    """读取 config.json，把账号密码、经纬度等填入全局变量
+
+    返回值：success=读取成功；failure=文件不存在或解析失败（首次运行会走“自动生成模板”分支）
+    关于账号密码的两种写法：明文，或 "#" 开头的 base64。
+    读到明文时会顺手转成 "#"+base64 存进内存，这样后面 writeUserData() 写回的就是编码后的，
+    避免明文密码一直原样躺在 config.json 里。
+    """
     global raw_username,raw_password,username,password,this_file_name,file_encoding,defult_longitude,defult_latitude,longitude,latitude,monkey_verify,state_file_name,config_file_name,username,password,expired,success,failure,unknow,checkIn_result,nowtime,checkIn_URL,location
 
     if(os.path.exists(config_file_name)): #存在config文件，读取保存的内容
@@ -128,17 +162,17 @@ def loadUserData():
 
 
             if raw_username!=unknow:
-                if raw_username[0]!='#':#明文账号
+                if raw_username[0]!='#':#明文账号：直接用，并转成 "#"+base64 准备写回文件
                     username=raw_username
                     raw_username='#'+base64.b64encode(raw_username.encode('utf-8')).decode('utf-8')
-                else:
+                else:#"#"+base64：解码出真实账号
                     username=base64.b64decode(raw_username[1:]).decode('utf-8')
 
             if raw_password!=unknow:
-                if raw_password[0]!='#':#明文密码
+                if raw_password[0]!='#':#明文密码：直接用，并转成 "#"+base64 准备写回文件
                     password=raw_password
                     raw_password='#'+base64.b64encode(raw_password.encode('utf-8')).decode('utf-8')
-                else:
+                else:#"#"+base64：解码出真实密码
                     password=base64.b64decode(raw_password[1:]).decode('utf-8')
 
 
@@ -147,6 +181,11 @@ def loadUserData():
         return failure
 
 def writeUserData():
+    """把当前账号/密码/经纬度等写回 config.json
+
+    写回的是 raw_username/raw_password（通常已是 "#"+base64 形式）；
+    expired 字段总是写当天日期，只是记录“上次运行时间”。
+    """
     global this_file_name,file_encoding,raw_username,raw_password,expired,defult_longitude,defult_latitude,longitude,latitude,monkey_verify,state_file_name,config_file_name,success,failure,unknow,checkIn_result,nowtime,checkIn_URL,location
     try:
         with open(config_file_name, 'w', encoding=file_encoding) as file:
@@ -168,7 +207,7 @@ def writeUserData():
     else:
         return success
 
-"""---------------------------------------------------------------------------------------------------------------------------"""
+# ==================== 滑块验证码处理（本地图像算法，纯 numpy） ====================
 from playwright.sync_api import Page
 import random
 
@@ -184,6 +223,8 @@ class CaptchaSolver:
     只用 numpy 实现，不依赖 OpenCV/Pillow。
     """
 
+    # 在页面里执行的 JS：一次拿回两个 canvas 的几何信息 + 全部像素数据。
+    # 像素用 getImageData 取出后转 base64 传回 Python（大数组跨进程传会慢）。
     JS_GET_CANVAS = """
     () => {
         const canvases = Array.from(document.querySelectorAll('canvas'));
@@ -211,6 +252,7 @@ class CaptchaSolver:
     }
     """
 
+    # 拖动后复查用：读拼图块 canvas 当前在页面里的 CSS x 坐标
     JS_BLOCK_X = """
     () => {
         const c = document.querySelector('canvas.block');
@@ -222,11 +264,15 @@ class CaptchaSolver:
         self.page = page
 
     def read_canvases(self):
-        """读取两个 canvas 的几何信息与像素数据"""
+        """读取两个 canvas 的几何信息与像素数据
+
+        返回 dict（bg/block 几何 + bg_rgba/block_rgba 两个 numpy 数组），
+        页面上找不到画布时返回 None。"""
         info = self.page.evaluate(self.JS_GET_CANVAS)
         if not info or not info.get("bg") or not info.get("block"):
-            return None
+            return None     #验证码还没渲染出来（或已经消失了）
         bg, block = info["bg"], info["block"]
+        #base64 → bytes → numpy：按 canvas 内部尺寸 reshape 成 (高, 宽, 4通道RGBA)
         bg_rgba = np.frombuffer(base64.b64decode(info["bgPixels"]), dtype=np.uint8)
         bg_rgba = bg_rgba.reshape((bg["pixelHeight"], bg["pixelWidth"], 4))
         block_rgba = np.frombuffer(base64.b64decode(info["blockPixels"]), dtype=np.uint8)
@@ -240,25 +286,31 @@ class CaptchaSolver:
 
     @staticmethod
     def piece_box(block_rgba):
-        """拼图块在它自己画布内的外接矩形 + 不透明掩膜"""
+        """拼图块在它自己画布内的外接矩形 + 不透明掩膜
+
+        拼图块画布大部分是透明区域(alpha≈0)，alpha>10 的像素就是拼图块本身。"""
         mask = block_rgba[:, :, 3] > 10
         ys, xs = np.nonzero(mask)
         if len(xs) == 0:
-            return None, mask
+            return None, mask    #整块画布都是透明的（拼图块还没画出来）
         return (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())), mask
 
     @staticmethod
     def find_gap(bg_gray, piece_gray, piece_mask, box, y_tolerance=4):
-        """在拼图块起点附近穷举，用零均值 NCC 找缺口位置
+        """在底图上穷举搜索缺口位置，用零均值 NCC(归一化互相关) 打分
+
+        原理：缺口 = 底图上被半透明遮罩压暗的同一块内容，内容本身没变；
+        NCC 对整体明暗变化免疫，所以拼图块内容与缺口处内容的相关性最高。
+        y_tolerance：纵向只在拼图块初始 y 附近 ±4 像素内搜索（缺口高度是固定的）。
 
         Returns:
-            (缺口x, 缺口y, 匹配得分) 画布内部像素坐标
+            (缺口x, 缺口y, 匹配得分)：画布内部像素坐标；没找到有效匹配时 x/y 为 None、得分 0
         """
         x0, y0, x1, y1 = box
         template = piece_gray[y0:y1 + 1, x0:x1 + 1]
         mask = piece_mask[y0:y1 + 1, x0:x1 + 1]
-        values = template[mask]
-        values = values - values.mean()
+        values = template[mask]             #拼图块的不透明像素灰度值
+        values = values - values.mean()     #减均值：对整体明暗变化免疫（遮罩压暗不影响匹配）
         norm = float(np.sqrt((values * values).sum()))
         if norm == 0:
             return None, None, 0.0
@@ -268,6 +320,7 @@ class CaptchaSolver:
         best_score, best_x, best_y = -2.0, None, None
         y_start = max(0, y0 - y_tolerance)
         y_end = min(bg_height - height, y0 + y_tolerance)
+        #在底图上逐行逐列滑动窗口，取相关性最高的位置
         for y in range(y_start, y_end + 1):
             row = bg_gray[y:y + height]
             for x in range(0, bg_width - width + 1):
@@ -304,7 +357,9 @@ class CaptchaSolver:
         return track
 
     def slide_by(self, cursor, y, distance):
-        """按拟人轨迹把鼠标从 cursor 处移动 distance 像素，返回移动后的 x 坐标"""
+        """按拟人轨迹把鼠标从 cursor 处移动 distance 像素，返回移动后的 x 坐标
+
+        每步之间 sleep 十几毫秒，模拟真人拖动速度（拖太快会被判定为机器）。"""
         for step in self.generate_track(distance):
             cursor += step
             self.page.mouse.move(cursor, y + random.uniform(-0.5, 0.5))
@@ -312,38 +367,49 @@ class CaptchaSolver:
         return cursor
 
     def drag_to_gap(self, images, gap_x):
-        """把拼图块拖到缺口处：几何换算 → 拖动 → 实测补偿 → 松手"""
+        """把拼图块拖到缺口处：几何换算 → 按下拖动 → 实测补偿 → 松手
+
+        Returns:
+            bool: 是否真的执行了拖动（拼图块/拖动柄没找到时返回 False）
+        """
         bg = images["bg"]
         box, _ = self.piece_box(images["block_rgba"])
         if box is None:
-            return False
+            return False    #整个拼图块画布都是透明的，说明拼图块还没画出来
 
         scale_bg = bg["width"] / float(bg["pixelWidth"])     # 底图画布内部像素 → CSS 像素
         scale_block = images["block"]["width"] / float(images["block"]["pixelWidth"])
         block_rect_before = float(self.page.evaluate(self.JS_BLOCK_X))
-        piece_before = block_rect_before + box[0] * scale_block
+        piece_before = block_rect_before + box[0] * scale_block   #拖动前拼图块的 CSS x 坐标
 
+        #拖动距离 = (缺口位置 − 拼图块起点) 换算成 CSS 像素；≤0 说明算反了，给个最小值兜底
         target = (gap_x - box[0]) * scale_bg
         if target <= 0:
             target = 1.0
         print("  缺口x=%d，拼图块x=%d，换算拖动距离=%.1f CSS像素" % (gap_x, box[0], target))
 
+        # 拖动起点 = 滑块(拖动柄)的中心点；找不到说明滑块还没渲染出来，放弃本次拖动
         slider_box = self.page.locator("div.slider").first.bounding_box()
+        if slider_box is None:
+            print("  没找到拖动滑块，放弃本次拖动")
+            return False
         start_x = slider_box["x"] + slider_box["width"] / 2
         start_y = slider_box["y"] + slider_box["height"] / 2
 
         self.page.mouse.move(start_x, start_y)
-        time.sleep(random.uniform(0.05, 0.12))
-        self.page.mouse.down()
-        time.sleep(random.uniform(0.05, 0.15))
+        time.sleep(random.uniform(0.05, 0.12))    #先把鼠标移到滑块上，稍作停顿
+        self.page.mouse.down()                    #按下左键
+        time.sleep(random.uniform(0.05, 0.15))    #再停顿一下才开始拖（模拟真人）
 
         cursor = self.slide_by(start_x, start_y, target)
         time.sleep(random.uniform(0.15, 0.3))
 
-        # 实测补偿：重新读一次拼图块位置，把误差补上（只补一次）
+        # 实测补偿：重新读一次拼图块位置，把误差补上（拖动轨迹是估算的，只补一次）
         try:
             images2 = self.read_canvases()
-            box2, _ = self.piece_box(images2["block_rgba"])
+            box2 = None
+            if images2 is not None:                 #画布可能刚好被刷新掉了，读不到就跳过补偿
+                box2, _ = self.piece_box(images2["block_rgba"])
             block_rect_after = float(self.page.evaluate(self.JS_BLOCK_X))
             if box2 is not None:
                 piece_after = block_rect_after + box2[0] * scale_block
@@ -375,7 +441,11 @@ class CaptchaSolver:
             return False
 
     def solve(self, max_attempts: int = 10):
-        """执行验证：定位缺口 → 拖到位 → 检查结果，失败才重试"""
+        """执行验证：定位缺口 → 拖到位 → 检查结果，失败就刷新验证码重试
+
+        单次尝试：滑块还在吗 → 读画布 → 找拼图块 → NCC 找缺口
+                  → 拖到位 → 等 1.5 秒判断是否通过；不通过就刷新换一张图
+        """
         for attempt in range(1, max_attempts + 1):
             try:
                 if not self.slider_visible():
@@ -399,13 +469,18 @@ class CaptchaSolver:
                                                     self.to_gray(block_rgba),
                                                     mask, box)
                 print("  第%d次尝试：定位缺口 x=%s y=%s 相似度=%.3f" % (attempt, gap_x, gap_y, score))
-                if gap_x is None or score < 0.5:
+                if gap_x is None or score < 0.5:#0.5 是经验阈值：NCC 这么低基本可以断定定位错了
                     print("  定位结果不可靠，重试")
                     self.click_refresh()
                     time.sleep(1)
                     continue
 
-                self.drag_to_gap(images, gap_x)
+                if not self.drag_to_gap(images, gap_x):
+                    #拼图块或拖动柄没找到（画布/滑块刚好没渲染出来），刷新验证码后重试
+                    print("  拖动没有执行，刷新验证码后重试")
+                    self.click_refresh()
+                    time.sleep(1.2)
+                    continue
                 time.sleep(1.5)
 
                 if self.verify_success():
@@ -419,7 +494,7 @@ class CaptchaSolver:
             except Exception as e:
                 print("  验证码处理异常:", e)
                 try:
-                    self.page.mouse.up()
+                    self.page.mouse.up()#异常时鼠标可能还按着，先松开再重试
                 except Exception:
                     pass
                 time.sleep(1)
@@ -438,6 +513,8 @@ class CaptchaSolver:
 def verify(page: Page, max_attempts: int = 10) -> bool:
     """
     验证码处理入口：本地图像算法定位缺口，一次拖到位
+
+    在 autoCheckIn() 里、monkey_verify=="true" 时被调用（登录提交后自动过滑块）。
 
     Args:
         page: Playwright页面对象
@@ -470,7 +547,12 @@ def get_checkin_labels(page: Page):
 
 
 def click_checkin_button(page: Page, label, text: str) -> bool:
-    """点击签到按钮，依次尝试多种方式"""
+    """点击签到按钮，依次尝试多种方式，任一成功即返回 True
+
+    1. 直接点文案元素（click 事件会冒泡到外层按钮容器）
+    2. 在 JS 里从文案往上找“像按钮”的祖先元素再点击
+    3. 老页面结构的备用选择器
+    """
     # 1.直接点击文案元素（click 事件会冒泡到外层按钮容器）
     try:
         label.click(timeout=5000)
@@ -514,9 +596,13 @@ def click_checkin_button(page: Page, label, text: str) -> bool:
     return False
 
 """---------------------------------------------------------------------------------------------------------------------------"""
+# ==================== 主流程 ====================
+
 def autoCheckIn():
+    """签到主流程：读配置 → 启动浏览器 → 登录(含验证码) → 定位签到按钮 → 点击 → 保存结果"""
     global this_file_name,file_encoding,defult_longitude,defult_latitude,longitude,latitude,monkey_verify,state_file_name,config_file_name,username,password,expired,success,failure,unknow,checkIn_result,nowtime,checkIn_URL,location
 
+    # ---------- 第 1 步：读取 config.json ----------
     print("如果是首次登陆，或者cookie已经过期，请注意重新登陆，cookie过期时间通常为一周")
 
     print("当前窗口名称为:"+this_file_name)
@@ -539,18 +625,21 @@ def autoCheckIn():
             print("注意：login.json 属于账号["+saved_account+"]，与 config.json 的账号["+username+"]不一致")
             print("已删除旧的登录状态，本次将用 config.json 里的账号重新登录")
             os.remove(state_file_name)
+    #浏览器的“虚拟定位”：签到系统按定位判断是否在签到范围内，这里上报 config.json 里的经纬度
     geolocation: Geolocation = {
     "longitude": float(longitude),
     "latitude": float(latitude),
     }
     location=geolocation
 
+    # ---------- 第 2 步：启动浏览器（用本机安装的 Edge，无需 playwright install） ----------
     with sync_playwright() as p:
         browser = p.chromium.launch(
             channel="msedge",    # 指定使用 Edge
             headless=False       # 设为 True 则无头模式运行
         )
 
+        #有 login.json 就带着 cookie 打开（免登录），没有则开一个全新会话
         context=None
         if os.path.exists(state_file_name):#存在cookie，直接使用
             context = browser.new_context(
@@ -567,6 +656,7 @@ def autoCheckIn():
             timezone_id="Asia/Shanghai",
             permissions=["geolocation"],
             )
+        # ---------- 第 3 步：打开签到页，检查登录状态 ----------
         page = context.new_page()#开启浏览器界面
         page.goto(checkIn_URL)
         time.sleep(2)
@@ -575,6 +665,7 @@ def autoCheckIn():
         #检查cookie是否可用,如果不可用，则会进入此处理流程
         #统一身份认证平台 该标题说明cookie过期
         if(page.title()=="统一身份认证平台"):
+            # ---------- 第 4 步：cookie 失效 → 自动登录 ----------
             page.click("#userNameLogin_a")#自动点击登陆选项卡
             time.sleep(1)
             page.click("#rememberMe")#勾选7天内自动登录
@@ -587,12 +678,14 @@ def autoCheckIn():
                 page.click("#login_submit")
                 time.sleep(1)
                 if(monkey_verify=="false"):
+                    #不自动过验证码：弹一个系统通知，提醒用户去浏览器里手动拖滑块
                     try:
                         toaster=ToastNotifier()
                         toaster.show_toast(this_file_name,"请过人机验证",duration=5,threaded=True)
                     except:
                         pass
                 else:
+                    #monkey_verify=="true"：用本地图像算法自动过滑块验证码
                     verify_res=verify(page)
                     if(verify_res==False):
                         print("验证失败")
@@ -602,6 +695,7 @@ def autoCheckIn():
                     else:
                         print("验证成功")
             else:
+                #config.json 没填账号密码：弹通知提醒用户在浏览器窗口里手动登录
                 try:
                     toaster=ToastNotifier()
                     toaster.show_toast(this_file_name,"请输入账号和密码",duration=5,threaded=True)
@@ -610,6 +704,7 @@ def autoCheckIn():
 
             if os.path.exists(state_file_name):
                 os.remove(state_file_name)
+            #等待登录完成：手动登录时脚本会一直在这里等，直到页面跳走
             while(page.title()=="统一身份认证平台"):
                 time.sleep(5)
             #登录成功后立即保存cookie，避免下次运行还要重新登录
@@ -619,7 +714,7 @@ def autoCheckIn():
             print("已保存登录状态到 "+state_file_name)
 
 
-
+        # ---------- 第 5 步：进入签到页，定位签到按钮 ----------
         time.sleep(1)
         context.set_geolocation(geolocation)
         if page.locator('.van-icon-replay').first.is_visible()==True:
@@ -632,6 +727,10 @@ def autoCheckIn():
         #检测签到按钮
         #页面同时存在“签到”“晚归签到”等多个同类元素，必须 count()+nth() 逐个取，
         #直接用 page.locator(...) 调用 is_visible()/click() 会触发 strict mode 异常导致脚本崩溃
+        #循环观察按钮文案（每轮重新扫一遍页面）：
+        #  “不在签到范围内”→ 没到时间，等 10 秒再看（最多 maxRetryTimes 次）
+        #  “签到”/“晚归签到” → 点击签到（试运行模式下跳过点击）
+        #  没有按钮        → 可能今天已经签过（看页面上的“归宿记录”关键字）
         retryTimes=0
         while True:
             candidates=get_checkin_labels(page)
@@ -665,36 +764,30 @@ def autoCheckIn():
             if target is None:
                 target=candidates[0]
             label,text=target
-            # try:
-            #     text = page.text_content('.xg-font-maintext-sub-weight')#.xg-font-maintext-sub-weight是签到按钮
-            # except BaseException:
-            #     print("发生未知错误")
-            #     #保存cookie
-            #     context.storage_state(path=state_file_name)
-            #     #保存配置文件
-            #     writeUserData()
-            #     time.sleep(10)
-            #     return 0
 
+            #根据按钮文案决定下一步：
             if(text=="不在签到范围内"):
+                #还没到签到时间段（比如还没到查寝时间），等 10 秒后再看一次
                 if(retryTimes>maxRetryTimes and maxRetryTimes>=0):
                     print("抵达最大尝试次数,停止尝试签到")
+                    checkIn_result="未到签到时间"    #给个结果，避免后面截图文件名变成空的 .png
                     break
                 retryTimes+=1
                 print("未到签到时间，等待...")
                 time.sleep(10)
             elif(text=="签到" or text=="晚归签到"):
                 if(dry_run):
+                    #试运行模式：验证“能不能找到按钮”这条链路，不真的点击
                     print("试运行模式(CHECKIN_DRY_RUN=1)：检测到可签到按钮["+text+"]，跳过点击")
                     checkIn_result="试运行未点击"
                     break
-                time.sleep(5)
+                time.sleep(5)               #点之前稍等，让页面渲染完
                 if(click_checkin_button(page,label,text)):
                     checkIn_result="签到成功"
                 else:
                     print("签到失败-[未能点击签到按钮]")
                     checkIn_result="签到失败"
-                time.sleep(5)
+                time.sleep(5)               #点完后等页面响应，再打印最新按钮状态
                 try:
                     print("点击后按钮状态:"+str([t for _,t in get_checkin_labels(page)]))
                 except Exception:
@@ -708,10 +801,11 @@ def autoCheckIn():
                 checkIn_result="签到失败"
                 print("按钮数值结果获取:"+str([t for _,t in candidates]))
                 break
-        #保存cookie
+        # ---------- 第 6 步：收尾（保存 cookie / 写回配置 / 写日志 / 截图） ----------
+        #保存cookie：下次运行就不用再登录了
         context.storage_state(path=state_file_name)
-        writeUserData()
-        writeLog(checkIn_result)
+        writeUserData()             #把账号、经纬度等写回 config.json
+        writeLog(checkIn_result)    #签到结果写入 log.log
 
         print("已完成签到流程，请注意查看结果")
         page.screenshot(path=os.path.join(base_dir,"%s.png"%(checkIn_result)))#保存结果
@@ -722,18 +816,18 @@ def autoCheckIn():
         #os.system("pause")
 
 
-
-        time.sleep(10)
+        time.sleep(10)     #等 10 秒再关浏览器，留时间给用户看结果
         browser.close()
         return 0
 
 
 
 if __name__ == "__main__":
+    #只有直接运行本文件才会执行（被 import 时不执行）
     try:
         autoCheckIn()
     except Exception:
         import traceback
         traceback.print_exc()
         if getattr(sys, "frozen", False):
-            input("程序出现异常，按回车键退出...")
+            input("程序出现异常，按回车键退出...")#双击 exe 运行时防止窗口一闪而过，方便看报错

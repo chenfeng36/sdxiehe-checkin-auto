@@ -88,6 +88,14 @@ python autoCheckIn.py --dry-run
 
 > 注意：试运行仍会正常登录（会提交账号密码、自动过滑块），只是不会点击签到按钮。
 
+## 多账号批量签到
+
+给多个账号签到（每个账号一份程序、一个文件夹）时，用配套调度器（见 [`qiandao_batch/`](qiandao_batch/)）：
+把所有账号程序的路径填进 `qiandao_batch\accounts.txt`，运行 `批量签到.exe` 即可——按顺序逐个签到，
+一个签完立即跑下一个，任务计划里也只需要挂这一个程序。
+
+详见 [`qiandao_batch/使用说明.txt`](qiandao_batch/使用说明.txt)。
+
 ## 打包 exe
 
 ```powershell

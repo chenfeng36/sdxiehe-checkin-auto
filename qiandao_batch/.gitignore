@@ -1,0 +1,5 @@
+__pycache__/
+build/
+批量签到.exe
+调度日志.log
+调度器运行中.lock
